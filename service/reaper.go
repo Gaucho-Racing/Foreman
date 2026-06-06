@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math/rand/v2"
 	"time"
 
 	"github.com/gaucho-racing/foreman/config"
@@ -11,10 +12,17 @@ import (
 // StartReaper sweeps in-flight runs whose lease has expired (the worker
 // crashed or stalled). Each abandoned run flips its parent job back to
 // pending if attempts remain, or terminalizes it as failed if exhausted.
+//
+// Replicas that boot together (e.g. during a rolling deploy) would
+// otherwise tick in lockstep, multiplying redundant CTE attempts by N.
+// A random 0..interval offset before the first sweep spreads them
+// across the cycle; after that each instance runs on its own cadence.
 func StartReaper() {
 	interval := time.Duration(config.ReaperIntervalSec) * time.Second
-	logger.SugarLogger.Infof("[REAPER] starting (tick=%s)", interval)
+	jitter := time.Duration(rand.Int64N(int64(interval)))
+	logger.SugarLogger.Infof("[REAPER] starting (tick=%s, initial jitter=%s)", interval, jitter)
 	go func() {
+		time.Sleep(jitter)
 		for {
 			if n, err := reapExpired(); err != nil {
 				logger.SugarLogger.Errorf("[REAPER] sweep failed: %v", err)
