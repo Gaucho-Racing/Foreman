@@ -51,9 +51,17 @@ jobs:
         with:
           images: ghcr.io/gaucho-racing/foreman
           tags: |
+            # main → :latest + :sha-...
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=tag
             type=sha
+            # Release tags strip the v prefix and emit :MAJOR.MINOR.PATCH,
+            # :MAJOR.MINOR, and :MAJOR so consumers can pin at whichever
+            # specificity they want. The `enable=…` predicate restricts
+            # these to actual `v…` git tags so the same workflow on main
+            # doesn't accidentally race them.
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
       - uses: docker/build-push-action@v5
         with:
           context: .
