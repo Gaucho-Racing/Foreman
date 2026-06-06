@@ -7,6 +7,7 @@ import (
 	"github.com/gaucho-racing/foreman/config"
 	"github.com/gaucho-racing/foreman/database"
 	"github.com/gaucho-racing/foreman/model"
+	"github.com/gaucho-racing/foreman/pkg/metrics"
 
 	ulid "github.com/gaucho-racing/ulid-go"
 	"gorm.io/gorm"
@@ -41,7 +42,15 @@ type EnqueueParams struct {
 }
 
 func Enqueue(p EnqueueParams) (model.Job, error) {
-	return enqueueTx(database.DB, p)
+	job, err := enqueueTx(database.DB, p)
+	switch {
+	case err == nil:
+		metrics.JobsEnqueued.WithLabelValues(job.Kind, job.Queue, "created").Inc()
+	case errors.Is(err, ErrConflict):
+		// `job` here is the *existing* row returned alongside ErrConflict.
+		metrics.JobsEnqueued.WithLabelValues(job.Kind, job.Queue, "deduped").Inc()
+	}
+	return job, err
 }
 
 func enqueueTx(tx *gorm.DB, p EnqueueParams) (model.Job, error) {
@@ -181,6 +190,18 @@ func Claim(p ClaimParams) (ClaimResult, bool, error) {
 	if err != nil {
 		return ClaimResult{}, false, err
 	}
+	if found {
+		metrics.JobsClaimed.WithLabelValues(out.Job.Kind, out.Job.Queue).Inc()
+		// First-attempt claim wait = time from enqueue to first claim.
+		// COALESCE preserves started_at across retries, so attempts > 1
+		// already had a "first claim time" recorded — don't observe.
+		if out.Job.AttemptCount == 1 && out.Job.StartedAt != nil {
+			wait := out.Job.StartedAt.Sub(out.Job.EnqueuedAt).Seconds()
+			if wait >= 0 {
+				metrics.ClaimWait.WithLabelValues(out.Job.Kind).Observe(wait)
+			}
+		}
+	}
 	return out, found, nil
 }
 
@@ -223,6 +244,13 @@ func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model
 		}
 		return tx.Where("id = ?", runID).First(&run).Error
 	})
+	if err == nil {
+		// Kind isn't on the run row; load via the parent job. Cheap
+		// PK lookup, only on the success path.
+		if job, gerr := Get(run.JobID); gerr == nil {
+			metrics.Heartbeats.WithLabelValues(job.Kind).Inc()
+		}
+	}
 	return run, err
 }
 
@@ -236,6 +264,7 @@ func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model
 func Complete(runID, workerID string, result model.JSON) (model.Job, error) {
 	now := time.Now()
 	var job model.Job
+	var run model.JobRun
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
 		runUpdates := map[string]any{
 			"status":           model.RunStatusSucceeded,
@@ -259,7 +288,6 @@ func Complete(runID, workerID string, result model.JSON) (model.Job, error) {
 
 		// The just-updated run row carries the parent job_id; read it
 		// back so we don't have to pass it through the API.
-		var run model.JobRun
 		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
 			return err
 		}
@@ -277,6 +305,12 @@ func Complete(runID, workerID string, result model.JSON) (model.Job, error) {
 		}
 		return tx.Where("id = ?", run.JobID).First(&job).Error
 	})
+	if err == nil {
+		metrics.JobsTerminal.WithLabelValues(job.Kind, model.StatusSucceeded).Inc()
+		metrics.RunsTerminal.WithLabelValues(job.Kind, model.RunStatusSucceeded).Inc()
+		observeJobLifetime(job)
+		observeRunDuration(job.Kind, model.RunStatusSucceeded, run.StartedAt, now)
+	}
 	return job, err
 }
 
@@ -293,6 +327,7 @@ func Complete(runID, workerID string, result model.JSON) (model.Job, error) {
 func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration, result model.JSON) (model.Job, error) {
 	now := time.Now()
 	var job model.Job
+	var run model.JobRun
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
 		runUpdates := map[string]any{
 			"status":           model.RunStatusFailed,
@@ -315,7 +350,6 @@ func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration,
 			return notRunningRunErr(runID)
 		}
 
-		var run model.JobRun
 		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
 			return err
 		}
@@ -340,6 +374,17 @@ func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration,
 		}
 		return tx.Where("id = ?", run.JobID).First(&job).Error
 	})
+	if err == nil {
+		// Every Fail closes a run; record that.
+		metrics.RunsTerminal.WithLabelValues(job.Kind, model.RunStatusFailed).Inc()
+		observeRunDuration(job.Kind, model.RunStatusFailed, run.StartedAt, now)
+		// Job-level terminal only fires when the parent flipped to a
+		// terminal status — i.e. retries were exhausted or non-retryable.
+		if job.IsTerminal() {
+			metrics.JobsTerminal.WithLabelValues(job.Kind, model.StatusFailed).Inc()
+			observeJobLifetime(job)
+		}
+	}
 	return job, err
 }
 
@@ -349,6 +394,28 @@ func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration,
 // cooperative cancellation (the worker observes cancel_requested on its
 // next heartbeat and stops via Fail). Terminal jobs are returned
 // unchanged.
+// observeJobLifetime records enqueued_at → completed_at for a terminal
+// job. Skips cleanly when CompletedAt is somehow unset.
+func observeJobLifetime(job model.Job) {
+	if job.CompletedAt == nil {
+		return
+	}
+	d := job.CompletedAt.Sub(job.EnqueuedAt).Seconds()
+	if d >= 0 {
+		metrics.JobLifetime.WithLabelValues(job.Kind, job.Status).Observe(d)
+	}
+}
+
+// observeRunDuration records started_at → now (or finished_at) for a
+// terminal run. Caller supplies the terminal status label so the same
+// helper covers succeeded / failed / abandoned.
+func observeRunDuration(kind, status string, startedAt, finishedAt time.Time) {
+	d := finishedAt.Sub(startedAt).Seconds()
+	if d >= 0 {
+		metrics.RunDuration.WithLabelValues(kind, status).Observe(d)
+	}
+}
+
 func Cancel(jobID string) (model.Job, error) {
 	now := time.Now()
 	var job model.Job
@@ -381,6 +448,14 @@ func Cancel(jobID string) (model.Job, error) {
 		}
 		return tx.Where("id = ?", jobID).First(&job).Error
 	})
+	// Only count "actually cancelled" transitions, not cooperative
+	// requests on still-running jobs (those land as Fail later) and
+	// not no-ops on already-terminal jobs.
+	if err == nil && job.Status == model.StatusCancelled && job.CompletedAt != nil &&
+		job.CompletedAt.Equal(now) {
+		metrics.JobsTerminal.WithLabelValues(job.Kind, model.StatusCancelled).Inc()
+		observeJobLifetime(job)
+	}
 	return job, err
 }
 

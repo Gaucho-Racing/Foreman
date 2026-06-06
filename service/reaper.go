@@ -7,6 +7,7 @@ import (
 	"github.com/gaucho-racing/foreman/config"
 	"github.com/gaucho-racing/foreman/database"
 	"github.com/gaucho-racing/foreman/pkg/logger"
+	"github.com/gaucho-racing/foreman/pkg/metrics"
 )
 
 // StartReaper sweeps in-flight runs whose lease has expired (the worker
@@ -32,14 +33,20 @@ func StartReaper() {
 		for {
 			if n, err := reapExpired(); err != nil {
 				logger.SugarLogger.Errorf("[REAPER] sweep failed: %v", err)
-			} else if n > 0 {
-				logger.SugarLogger.Warnf("[REAPER] reclaimed %d expired lease(s)", n)
+				metrics.ReaperSweeps.WithLabelValues("error").Inc()
+			} else {
+				metrics.ReaperSweeps.WithLabelValues("success").Inc()
+				if n > 0 {
+					logger.SugarLogger.Warnf("[REAPER] reclaimed %d expired lease(s)", n)
+					metrics.ReaperReaped.Add(float64(n))
+				}
 			}
 			if config.RetentionDays > 0 {
 				if n, err := pruneOldJobs(config.RetentionDays); err != nil {
 					logger.SugarLogger.Errorf("[REAPER] retention sweep failed: %v", err)
 				} else if n > 0 {
 					logger.SugarLogger.Infof("[REAPER] retention deleted %d terminal job(s)", n)
+					metrics.RetentionDeleted.Add(float64(n))
 				}
 			}
 			time.Sleep(interval)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gaucho-racing/foreman/config"
 	"github.com/gaucho-racing/foreman/pkg/logger"
+	"github.com/gaucho-racing/foreman/pkg/metrics"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -37,6 +38,9 @@ func InitializeRouter() *gin.Engine {
 func InitializeRoutes(router *gin.Engine) {
 	p := config.Service.PathPrefix()
 	router.GET(fmt.Sprintf("/%s/ping", p), Ping)
+	// Standard Prometheus scrape target. Private registry — no leakage
+	// from third-party libs that may MustRegister globally.
+	router.GET(fmt.Sprintf("/%s/metrics", p), gin.WrapH(metrics.Handler()))
 
 	// All endpoints are public for now — no auth layer. Re-add a
 	// RequireToken middleware and a Group + .Use(...) for the writes

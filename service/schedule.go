@@ -7,6 +7,7 @@ import (
 
 	"github.com/gaucho-racing/foreman/database"
 	"github.com/gaucho-racing/foreman/model"
+	"github.com/gaucho-racing/foreman/pkg/metrics"
 
 	ulid "github.com/gaucho-racing/ulid-go"
 	"github.com/robfig/cron/v3"
@@ -202,7 +203,7 @@ func FireSchedule(id string) (model.Job, error) {
 	// Use a unique idempotency key so this manual fire doesn't collide
 	// with any scheduled fire at the same instant.
 	key := fmt.Sprintf("sched:%s:manual:%s", s.ID, ulid.Make().String())
-	return Enqueue(EnqueueParams{
+	job, err := Enqueue(EnqueueParams{
 		Kind:           s.Kind,
 		Queue:          s.Queue,
 		Service:        s.Service,
@@ -211,6 +212,10 @@ func FireSchedule(id string) (model.Job, error) {
 		Priority:       s.Priority,
 		MaxAttempts:    s.MaxAttempts,
 	})
+	if err == nil || errors.Is(err, ErrConflict) {
+		metrics.SchedulesFired.Inc()
+	}
+	return job, err
 }
 
 // ---------- Tick (called by the scheduler goroutine) ----------
@@ -278,6 +283,9 @@ func Tick() (int, error) {
 		}
 		return nil
 	})
+	if fired > 0 {
+		metrics.SchedulesFired.Add(float64(fired))
+	}
 	return fired, err
 }
 
