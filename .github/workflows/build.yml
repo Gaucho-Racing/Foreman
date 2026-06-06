@@ -21,7 +21,14 @@ jobs:
       - name: Build
         run: go build ./...
       - name: Test
-        run: go test -race ./...
+        # ubuntu-latest ships Docker, which is all testcontainers-go
+        # needs. -race + -count=1 surfaces concurrency bugs and skips
+        # the test cache so we always actually run.
+        env:
+          # On GH Actions the Docker socket lives at the standard
+          # path; no override needed. We rely on the default.
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+        run: go test -race -count=1 -timeout=300s ./...
 
   image:
     name: Build + push image

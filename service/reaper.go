@@ -57,12 +57,15 @@ func StartReaper() {
 // pruneOldJobs deletes terminal jobs older than `days` days. Schedules
 // and in-flight jobs are untouched — only completed history goes.
 // FK CASCADE on job_runs.job_id auto-deletes corresponding runs.
+// Uses make_interval(days => ?) instead of (? || ' days')::interval so
+// pgx can bind the parameter as an int — the text-concat form forces a
+// text encode of `days` that pgx refuses to plan automatically.
 func pruneOldJobs(days int) (int64, error) {
 	sql := `
 		DELETE FROM jobs
 		WHERE status IN ('succeeded','failed','cancelled')
 		  AND completed_at IS NOT NULL
-		  AND completed_at < now() - (? || ' days')::interval;`
+		  AND completed_at < now() - make_interval(days => ?);`
 	res := database.DB.Exec(sql, days)
 	return res.RowsAffected, res.Error
 }
