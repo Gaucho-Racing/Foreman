@@ -34,3 +34,9 @@ go.work.sum
 # build artifacts
 /tmp/
 /foreman
+
+# Python — pycache from anyone importing clients/python/foreman.py
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
