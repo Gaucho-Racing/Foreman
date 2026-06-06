@@ -70,8 +70,29 @@ curl -X POST localhost:7011/foreman/jobs/<id>/fail \
 # Cancel
 curl -X POST localhost:7011/foreman/jobs/<id>/cancel
 
+# Per-attempt history (one row per claim)
+curl localhost:7011/foreman/jobs/<id>/runs
+
 # Stream state (SSE; one event per change; closes on terminal)
 curl -N localhost:7011/foreman/events/<id>
+```
+
+## Job runs
+
+Every time a worker claims a job, Foreman writes a `job_runs` row
+recording that attempt — worker id, start/finish, last-known progress,
+terminal error or result. The parent job row keeps the "what is this
+doing right now" denorm (latest worker, current lease), but `job_runs`
+is the immutable audit trail. A job that succeeded on its third try
+will have three rows: two `failed`, one `succeeded`. A job whose worker
+crashed mid-attempt gets a row marked `abandoned` by the reaper.
+
+```sh
+$ curl localhost:7011/foreman/jobs/job_.../runs
+[
+  { "attempt": 1, "worker_id": "w-1", "status": "failed",    "error": "smtp timeout", ... },
+  { "attempt": 2, "worker_id": "w-2", "status": "succeeded", "result": {"sent": true}, ... }
+]
 ```
 
 Full route list: see `api/api.go`.

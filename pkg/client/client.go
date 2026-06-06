@@ -198,6 +198,46 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	return c.simplePost(ctx, "/foreman/jobs/"+jobID+"/cancel", struct{}{}, "cancel")
 }
 
+// Run is one attempt at running a job — see model.JobRun on the server.
+// Each call to Claim creates a new Run.
+type Run struct {
+	ID              string          `json:"id"`
+	JobID           string          `json:"job_id"`
+	Attempt         int             `json:"attempt"`
+	WorkerID        string          `json:"worker_id"`
+	Status          string          `json:"status"`
+	ProgressCurrent int64           `json:"progress_current"`
+	ProgressTotal   int64           `json:"progress_total"`
+	ProgressMessage string          `json:"progress_message,omitempty"`
+	Error           string          `json:"error,omitempty"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	LeaseExpiresAt  *time.Time      `json:"lease_expires_at,omitempty"`
+	StartedAt       time.Time       `json:"started_at"`
+	FinishedAt      *time.Time      `json:"finished_at,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+}
+
+// ListRuns returns every attempt at the given job, oldest first.
+func (c *Client) ListRuns(ctx context.Context, jobID string) ([]Run, error) {
+	if c.disabled() {
+		return nil, nil
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/foreman/jobs/"+jobID+"/runs", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("list-runs", resp)
+	}
+	var out []Run
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list-runs decode: %w", err)
+	}
+	return out, nil
+}
+
 func (c *Client) simplePost(ctx context.Context, path string, body any, op string) error {
 	resp, err := c.do(ctx, http.MethodPost, path, body)
 	if err != nil {

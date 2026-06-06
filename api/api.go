@@ -44,6 +44,7 @@ func InitializeRoutes(router *gin.Engine) {
 	// we want to lock this back down.
 	router.GET(fmt.Sprintf("/%s/jobs", p), ListJobs)
 	router.GET(fmt.Sprintf("/%s/jobs/:id", p), GetJob)
+	router.GET(fmt.Sprintf("/%s/jobs/:id/runs", p), ListJobRuns)
 	router.GET(fmt.Sprintf("/%s/events/:id", p), StreamJobEvents)
 	router.POST(fmt.Sprintf("/%s/jobs", p), EnqueueJob)
 	router.POST(fmt.Sprintf("/%s/claim", p), ClaimJob)

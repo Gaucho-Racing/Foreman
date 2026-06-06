@@ -160,6 +160,23 @@ func GetJob(c *gin.Context) {
 	c.JSON(http.StatusOK, job)
 }
 
+// ListJobRuns returns every attempt at a job, oldest first. 404s match
+// GetJob: a missing job id returns 404 here too (instead of an empty
+// list) so the dashboard can disambiguate "no runs yet" from "wrong id".
+func ListJobRuns(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := service.Get(id); err != nil {
+		respondServiceErr(c, err)
+		return
+	}
+	runs, err := service.ListRuns(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, runs)
+}
+
 func ListJobs(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	jobs, err := service.List(service.ListFilter{

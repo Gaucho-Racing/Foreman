@@ -108,8 +108,9 @@ type ClaimParams struct {
 
 // Claim atomically leases the highest-priority eligible pending job to the
 // caller using SELECT ... FOR UPDATE SKIP LOCKED, so concurrent workers
-// never grab the same job. Returns (job, true) on success or (_, false)
-// when nothing is claimable.
+// never grab the same job. The same transaction inserts a JobRun row, so
+// each attempt is recorded the moment it starts — not retroactively.
+// Returns (job, true) on success or (_, false) when nothing is claimable.
 func Claim(p ClaimParams) (model.Job, bool, error) {
 	if len(p.Kinds) == 0 {
 		return model.Job{}, false, nil
@@ -117,7 +118,8 @@ func Claim(p ClaimParams) (model.Job, bool, error) {
 	if p.LeaseSec <= 0 {
 		p.LeaseSec = config.DefaultLeaseSec
 	}
-	lease := time.Now().Add(time.Duration(p.LeaseSec) * time.Second)
+	now := time.Now()
+	lease := now.Add(time.Duration(p.LeaseSec) * time.Second)
 
 	sql := `
 		UPDATE jobs SET
@@ -146,63 +148,126 @@ func Claim(p ClaimParams) (model.Job, bool, error) {
 	}
 
 	var job model.Job
-	res := database.DB.Raw(sql, p.WorkerID, lease, p.Kinds, noQueueFilter, queues).Scan(&job)
-	if res.Error != nil {
-		return model.Job{}, false, res.Error
+	var found bool
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Raw(sql, p.WorkerID, lease, p.Kinds, noQueueFilter, queues).Scan(&job)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 || job.ID == "" {
+			return nil
+		}
+		found = true
+		run := model.JobRun{
+			ID:             ulid.Make().Prefixed("run"),
+			JobID:          job.ID,
+			Attempt:        job.Attempt,
+			WorkerID:       p.WorkerID,
+			Status:         model.RunStatusRunning,
+			LeaseExpiresAt: &lease,
+			StartedAt:      now,
+		}
+		return tx.Create(&run).Error
+	})
+	if err != nil {
+		return model.Job{}, false, err
 	}
-	if res.RowsAffected == 0 {
-		return model.Job{}, false, nil
-	}
-	return job, true, nil
+	return job, found, nil
 }
 
 func Heartbeat(id, workerID string, prog ProgressUpdate, leaseSec int) (model.Job, error) {
 	if leaseSec <= 0 {
 		leaseSec = config.DefaultLeaseSec
 	}
-	updates := map[string]any{
-		"lease_expires_at": time.Now().Add(time.Duration(leaseSec) * time.Second),
-		"updated_at":       time.Now(),
-	}
-	applyProgress(updates, prog)
+	now := time.Now()
+	lease := now.Add(time.Duration(leaseSec) * time.Second)
 
-	res := database.DB.Model(&model.Job{}).
-		Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
-		Updates(updates)
-	if res.Error != nil {
-		return model.Job{}, res.Error
+	jobUpdates := map[string]any{
+		"lease_expires_at": lease,
+		"updated_at":       now,
 	}
-	if res.RowsAffected == 0 {
-		return model.Job{}, notRunningErr(id)
+	applyProgress(jobUpdates, prog)
+
+	var out model.Job
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.Job{}).
+			Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
+			Updates(jobUpdates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return notRunningErr(id)
+		}
+		if err := tx.Where("id = ?", id).First(&out).Error; err != nil {
+			return err
+		}
+		runUpdates := map[string]any{
+			"lease_expires_at": lease,
+			"updated_at":       now,
+		}
+		applyProgress(runUpdates, prog)
+		return tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND attempt = ? AND status = ?",
+				id, out.Attempt, model.RunStatusRunning).
+			Updates(runUpdates).Error
+	})
+	if err != nil {
+		return model.Job{}, err
 	}
-	return Get(id)
+	return out, nil
 }
 
 func Complete(id, workerID string, result model.JSON) (model.Job, error) {
-	updates := map[string]any{
+	now := time.Now()
+	jobUpdates := map[string]any{
 		"status":      model.StatusSucceeded,
-		"finished_at": time.Now(),
-		"updated_at":  time.Now(),
+		"finished_at": now,
+		"updated_at":  now,
 	}
 	if result != nil {
-		updates["result"] = result
+		jobUpdates["result"] = result
 	}
-	res := database.DB.Model(&model.Job{}).
-		Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
-		Updates(updates)
-	if res.Error != nil {
-		return model.Job{}, res.Error
+	var out model.Job
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.Job{}).
+			Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
+			Updates(jobUpdates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return notRunningErr(id)
+		}
+		if err := tx.Where("id = ?", id).First(&out).Error; err != nil {
+			return err
+		}
+		runUpdates := map[string]any{
+			"status":           model.RunStatusSucceeded,
+			"finished_at":      now,
+			"lease_expires_at": nil,
+			"updated_at":       now,
+		}
+		if result != nil {
+			runUpdates["result"] = result
+		}
+		return tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND attempt = ? AND status = ?",
+				id, out.Attempt, model.RunStatusRunning).
+			Updates(runUpdates).Error
+	})
+	if err != nil {
+		return model.Job{}, err
 	}
-	if res.RowsAffected == 0 {
-		return model.Job{}, notRunningErr(id)
-	}
-	return Get(id)
+	return out, nil
 }
 
 // Fail records a failed attempt. When retryable and attempts remain, the
 // job returns to pending with a backoff delay; otherwise it is marked
-// failed terminally.
+// failed terminally. Either way, the in-flight JobRun is closed out as
+// status=failed — so a retried job has a clean trail of past attempts.
 func Fail(id, workerID, errMsg string, retryable bool, backoff time.Duration) (model.Job, error) {
+	now := time.Now()
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
 		var job model.Job
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -214,17 +279,31 @@ func Fail(id, workerID, errMsg string, retryable bool, backoff time.Duration) (m
 			return err
 		}
 
-		updates := map[string]any{"error": errMsg, "updated_at": time.Now()}
+		jobUpdates := map[string]any{"error": errMsg, "updated_at": now}
 		if retryable && job.Attempt < job.MaxAttempts {
-			updates["status"] = model.StatusPending
-			updates["worker_id"] = ""
-			updates["lease_expires_at"] = nil
-			updates["scheduled_at"] = time.Now().Add(backoff)
+			jobUpdates["status"] = model.StatusPending
+			jobUpdates["worker_id"] = ""
+			jobUpdates["lease_expires_at"] = nil
+			jobUpdates["scheduled_at"] = now.Add(backoff)
 		} else {
-			updates["status"] = model.StatusFailed
-			updates["finished_at"] = time.Now()
+			jobUpdates["status"] = model.StatusFailed
+			jobUpdates["finished_at"] = now
 		}
-		return tx.Model(&model.Job{}).Where("id = ?", id).Updates(updates).Error
+		if err := tx.Model(&model.Job{}).Where("id = ?", id).Updates(jobUpdates).Error; err != nil {
+			return err
+		}
+		// Close out the in-flight run regardless of whether the parent
+		// job retries — runs are immutable history once terminal.
+		return tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND attempt = ? AND status = ?",
+				id, job.Attempt, model.RunStatusRunning).
+			Updates(map[string]any{
+				"status":           model.RunStatusFailed,
+				"finished_at":      now,
+				"lease_expires_at": nil,
+				"error":            errMsg,
+				"updated_at":       now,
+			}).Error
 	})
 	if err != nil {
 		return model.Job{}, err
@@ -276,6 +355,18 @@ func Get(id string) (model.Job, error) {
 		return model.Job{}, err
 	}
 	return job, nil
+}
+
+// ListRuns returns every attempt at running the given job, oldest first.
+// Useful for the dashboard and for callers debugging "what went wrong on
+// attempt N".
+func ListRuns(jobID string) ([]model.JobRun, error) {
+	var runs []model.JobRun
+	err := database.DB.
+		Where("job_id = ?", jobID).
+		Order("attempt ASC").
+		Find(&runs).Error
+	return runs, err
 }
 
 type ListFilter struct {
