@@ -61,4 +61,13 @@ func InitializeRoutes(router *gin.Engine) {
 	router.POST(fmt.Sprintf("/%s/runs/:id/heartbeat", p), HeartbeatRun)
 	router.POST(fmt.Sprintf("/%s/runs/:id/complete", p), CompleteRun)
 	router.POST(fmt.Sprintf("/%s/runs/:id/fail", p), FailRun)
+
+	// Schedules — recurring (or future one-shot) recipes for enqueuing
+	// jobs. A separate scheduler goroutine ticks and fires these.
+	router.POST(fmt.Sprintf("/%s/schedules", p), CreateSchedule)
+	router.GET(fmt.Sprintf("/%s/schedules", p), ListSchedules)
+	router.GET(fmt.Sprintf("/%s/schedules/:id", p), GetSchedule)
+	router.PUT(fmt.Sprintf("/%s/schedules/:id", p), UpdateSchedule)
+	router.DELETE(fmt.Sprintf("/%s/schedules/:id", p), DeleteSchedule)
+	router.POST(fmt.Sprintf("/%s/schedules/:id/fire", p), FireSchedule)
 }

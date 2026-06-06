@@ -38,6 +38,7 @@ func Verify() {
 
 	ReaperIntervalSec = intEnv(ReaperIntervalRaw, "FOREMAN_REAPER_INTERVAL_SEC", 10)
 	DefaultLeaseSec = intEnv(DefaultLeaseRaw, "FOREMAN_DEFAULT_LEASE_SEC", 60)
+	SchedulerIntervalSec = intEnv(SchedulerIntervalRaw, "FOREMAN_SCHEDULER_INTERVAL_SEC", 1)
 }
 
 func intEnv(raw, name string, def int) int {

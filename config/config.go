@@ -36,6 +36,12 @@ var ReaperIntervalSec int
 var DefaultLeaseRaw = os.Getenv("FOREMAN_DEFAULT_LEASE_SEC")
 var DefaultLeaseSec int
 
+// SchedulerIntervalSec is how often the scheduler tick runs. Short by
+// default (1s) so "fire every minute" actually fires within ~1s of the
+// minute boundary.
+var SchedulerIntervalRaw = os.Getenv("FOREMAN_SCHEDULER_INTERVAL_SEC")
+var SchedulerIntervalSec int
+
 var Env = os.Getenv("ENV")
 var Port = os.Getenv("PORT")
 

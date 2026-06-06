@@ -30,7 +30,7 @@ func Init() {
 		}
 	} else {
 		logger.SugarLogger.Infoln("Connected to database")
-		db.AutoMigrate(&model.Job{}, &model.JobRun{})
+		db.AutoMigrate(&model.Job{}, &model.JobRun{}, &model.Schedule{})
 		logger.SugarLogger.Infoln("AutoMigration complete")
 		DB = db
 	}
