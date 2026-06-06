@@ -37,9 +37,10 @@ type JobRun struct {
 
 	// LeaseExpiresAt is meaningful only while status='running'. Reaper
 	// uses this to detect abandoned leases. Set to NULL on any terminal
-	// transition. Indexed for the reaper sweep — terminal rows have NULL
-	// here, so the index naturally covers only in-flight runs.
-	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty" gorm:"index"`
+	// transition. The supporting index is partial on status='running'
+	// and is created in database.Init's applySchemaExtensions — GORM
+	// tags can't express partial indexes.
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
 
 	ProgressCurrent int64  `json:"progress_current" gorm:"not null;default:0"`
 	ProgressTotal   int64  `json:"progress_total" gorm:"not null;default:0"`
