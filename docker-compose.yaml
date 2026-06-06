@@ -1,0 +1,45 @@
+name: foreman
+
+services:
+  foreman:
+    container_name: foreman
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "7011:7011"
+    volumes:
+      - .:/app/foreman
+      - foreman_go_cache:/go
+    environment:
+      ENV: "DEV"
+      PORT: "7011"
+      DATABASE_HOST: "db"
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: "foreman"
+      DATABASE_USER: "postgres"
+      DATABASE_PASSWORD: "password"
+      FOREMAN_REAPER_INTERVAL_SEC: "10"
+      FOREMAN_DEFAULT_LEASE_SEC: "60"
+
+  db:
+    container_name: foreman-db
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "password"
+      POSTGRES_DB: "foreman"
+    ports:
+      - "5433:5432"  # 5433 host-side so a co-resident Postgres on 5432 doesn't clash
+    volumes:
+      # Mount the parent dir, not /var/lib/postgresql/data — pg18+ writes to
+      # a version-specific subdir (e.g. /var/lib/postgresql/18/docker).
+      - foreman_pgdata:/var/lib/postgresql
+
+volumes:
+  foreman_pgdata:
+  foreman_go_cache:

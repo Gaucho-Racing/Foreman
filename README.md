@@ -1,2 +1,133 @@
 # Foreman
-Lightweight job orchestration backed by Postgres.
+
+Lightweight job orchestration backed by Postgres. Producers enqueue jobs
+with an optional idempotency key; workers claim them by kind, lease them,
+report progress + outcome. A reaper sweeps abandoned leases back to
+pending so a worker crash never leaves work stuck.
+
+Originally extracted from [Gaucho Racing's Mapache](https://github.com/Gaucho-Racing/Mapache);
+now standalone so other GR projects (and anyone else) can drop it in.
+
+## Why
+
+Most teams don't need Sidekiq / Resque / Temporal — they need "kick off
+a job from one service, have another service pick it up, get retries +
+idempotency + cancel for free." Foreman is one binary + one Postgres
+table and goes from zero to running in a few seconds.
+
+Concretely:
+
+- **Idempotent enqueue.** A unique `(kind, idempotency_key)` index turns
+  "we already kicked off X" tracking tables into one extra column.
+- **Atomic claim.** `SELECT ... FOR UPDATE SKIP LOCKED` so N workers
+  never grab the same job.
+- **Lease + heartbeat.** Workers must heartbeat or the reaper hands the
+  job to someone else.
+- **Retries with backoff.** Failed-but-retryable jobs return to pending
+  with a per-call backoff delay.
+- **Cooperative cancel.** Pending jobs flip to cancelled immediately;
+  running jobs see `cancel_requested` on their next heartbeat.
+- **SSE stream.** `GET /foreman/events/:id` pushes the job's current
+  state until terminal, for dashboards that want live progress.
+
+## Run it
+
+```sh
+# Containerized (foreman + Postgres):
+make docker-up
+curl localhost:7011/foreman/ping
+
+# Or against your own Postgres:
+cp .env.example .env  # edit if needed
+make run
+```
+
+## Quick tour of the API
+
+```sh
+# Enqueue
+curl -X POST localhost:7011/foreman/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"send-email","params":{"to":"x@y.com"},"max_attempts":3,"idempotency_key":"email-42"}'
+
+# Claim one
+curl -X POST localhost:7011/foreman/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"kinds":["send-email"],"worker_id":"worker-1","lease_seconds":60}'
+
+# Heartbeat / progress
+curl -X POST localhost:7011/foreman/jobs/<id>/heartbeat \
+  -d '{"worker_id":"worker-1","progress_current":12,"progress_total":100,"lease_seconds":60}'
+
+# Complete
+curl -X POST localhost:7011/foreman/jobs/<id>/complete \
+  -d '{"worker_id":"worker-1","result":{"sent":true}}'
+
+# Fail (retryable)
+curl -X POST localhost:7011/foreman/jobs/<id>/fail \
+  -d '{"worker_id":"worker-1","error":"smtp timeout","retryable":true,"backoff_seconds":30}'
+
+# Cancel
+curl -X POST localhost:7011/foreman/jobs/<id>/cancel
+
+# Stream state (SSE; one event per change; closes on terminal)
+curl -N localhost:7011/foreman/events/<id>
+```
+
+Full route list: see `api/api.go`.
+
+## Go client
+
+Other Go services can talk to Foreman via the included SDK:
+
+```go
+import "github.com/gaucho-racing/foreman/pkg/client"
+
+c := client.New("http://foreman:7011")
+
+// Producer
+res, err := c.Enqueue(ctx, client.EnqueueRequest{
+    Kind:           "send-email",
+    Params:         json.RawMessage(`{"to":"x@y.com"}`),
+    IdempotencyKey: ptr("email-42"),
+    MaxAttempts:    3,
+})
+
+// Worker
+job, err := c.Claim(ctx, client.ClaimRequest{
+    Kinds: []string{"send-email"}, WorkerID: "worker-1", LeaseSec: 60,
+})
+```
+
+An empty endpoint makes every method a no-op success — handy for
+environments where Foreman is optional.
+
+## Configuration
+
+| Env                              | Default     | Notes |
+|----------------------------------|-------------|-------|
+| `ENV`                            | `PROD`      | Set to `DEV` for pretty logs + dev-mode Gin. |
+| `PORT`                           | `7011`      | HTTP listen port. |
+| `DATABASE_HOST`                  | `localhost` | Postgres host. |
+| `DATABASE_PORT`                  | `5432`      | Postgres port. |
+| `DATABASE_NAME`                  | `foreman`   | Database name. |
+| `DATABASE_USER`                  | `postgres`  | User. |
+| `DATABASE_PASSWORD`              | `password`  | Password. |
+| `FOREMAN_REAPER_INTERVAL_SEC`    | `10`        | Reaper sweep cadence. |
+| `FOREMAN_DEFAULT_LEASE_SEC`      | `60`        | Lease length when claim omits one. |
+
+## Layout
+
+```
+api/         HTTP routes (Gin)
+config/      env loading + service info
+database/    GORM bootstrap + auto-migration
+model/       Job (and soon JobRun) row types
+service/     enqueue/claim/heartbeat/complete/fail + reaper
+pkg/logger/  zap setup
+pkg/client/  reusable Go SDK
+```
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
