@@ -97,32 +97,6 @@ $ curl localhost:7011/foreman/jobs/job_.../runs
 
 Full route list: see `api/api.go`.
 
-## Go client
-
-Other Go services can talk to Foreman via the included SDK:
-
-```go
-import "github.com/gaucho-racing/foreman/pkg/client"
-
-c := client.New("http://foreman:7011")
-
-// Producer
-res, err := c.Enqueue(ctx, client.EnqueueRequest{
-    Kind:           "send-email",
-    Params:         json.RawMessage(`{"to":"x@y.com"}`),
-    IdempotencyKey: ptr("email-42"),
-    MaxAttempts:    3,
-})
-
-// Worker
-job, err := c.Claim(ctx, client.ClaimRequest{
-    Kinds: []string{"send-email"}, WorkerID: "worker-1", LeaseSec: 60,
-})
-```
-
-An empty endpoint makes every method a no-op success — handy for
-environments where Foreman is optional.
-
 ## Configuration
 
 | Env                              | Default     | Notes |
@@ -146,7 +120,6 @@ database/    GORM bootstrap + auto-migration
 model/       Job (and soon JobRun) row types
 service/     enqueue/claim/heartbeat/complete/fail + reaper
 pkg/logger/  zap setup
-pkg/client/  reusable Go SDK
 ```
 
 ## License
