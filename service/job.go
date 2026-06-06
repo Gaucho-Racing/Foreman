@@ -217,7 +217,12 @@ type ProgressUpdate struct {
 // optionally writes progress. Identifies the run by id (not job id) —
 // workers received the run id from Claim and use it for every
 // lease-scoped mutation. Touches only job_runs.
-func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model.JobRun, error) {
+//
+// Returns the updated run plus a cancelRequested flag read off the parent
+// job in the same call. Workers piggyback cancellation observation on the
+// heartbeat they were already sending — no separate Get round-trip — so
+// cooperative cancel is detected within one HeartbeatInterval.
+func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model.JobRun, bool, error) {
 	if leaseSec <= 0 {
 		leaseSec = config.DefaultLeaseSec
 	}
@@ -231,6 +236,7 @@ func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model
 	applyProgress(updates, prog)
 
 	var run model.JobRun
+	var cancelRequested bool
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).
 			Where("id = ? AND worker_id = ? AND status = ?",
@@ -242,7 +248,15 @@ func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model
 		if res.RowsAffected == 0 {
 			return notRunningRunErr(runID)
 		}
-		return tx.Where("id = ?", runID).First(&run).Error
+		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
+			return err
+		}
+		// Single-column read off the parent job in the same tx —
+		// guarantees we see Cancel()'s commit if it ordered before us.
+		return tx.Model(&model.Job{}).
+			Select("cancel_requested").
+			Where("id = ?", run.JobID).
+			Row().Scan(&cancelRequested)
 	})
 	if err == nil {
 		// Kind isn't on the run row; load via the parent job. Cheap
@@ -251,7 +265,7 @@ func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model
 			metrics.Heartbeats.WithLabelValues(job.Kind).Inc()
 		}
 	}
-	return run, err
+	return run, cancelRequested, err
 }
 
 // ---------- Complete ----------
@@ -362,10 +376,17 @@ func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration,
 		}
 
 		jobUpdates := map[string]any{"updated_at": now}
-		if retryable && job.AttemptCount < job.MaxAttempts {
+		switch {
+		case job.CancelRequested:
+			// Cancel intent always wins, regardless of attempts left or
+			// the worker's retryable hint — the worker bailed because
+			// we asked it to, so the job is cancelled, not failed.
+			jobUpdates["status"] = model.StatusCancelled
+			jobUpdates["completed_at"] = now
+		case retryable && job.AttemptCount < job.MaxAttempts:
 			jobUpdates["status"] = model.StatusPending
 			jobUpdates["scheduled_at"] = now.Add(backoff)
-		} else {
+		default:
 			jobUpdates["status"] = model.StatusFailed
 			jobUpdates["completed_at"] = now
 		}
@@ -379,9 +400,10 @@ func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration,
 		metrics.RunsTerminal.WithLabelValues(job.Kind, model.RunStatusFailed).Inc()
 		observeRunDuration(job.Kind, model.RunStatusFailed, run.StartedAt, now)
 		// Job-level terminal only fires when the parent flipped to a
-		// terminal status — i.e. retries were exhausted or non-retryable.
+		// terminal status — i.e. retries were exhausted, non-retryable,
+		// or cancel-requested intercepted the Fail.
 		if job.IsTerminal() {
-			metrics.JobsTerminal.WithLabelValues(job.Kind, model.StatusFailed).Inc()
+			metrics.JobsTerminal.WithLabelValues(job.Kind, job.Status).Inc()
 			observeJobLifetime(job)
 		}
 	}

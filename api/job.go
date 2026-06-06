@@ -109,13 +109,23 @@ type heartbeatRequest struct {
 	LeaseSec        int     `json:"lease_seconds"`
 }
 
+// heartbeatResponse marshals all JobRun fields at the top level plus a
+// sibling `cancel_requested` lifted off the parent job — workers use it
+// as the cooperative-cancel signal without an extra GetJob round-trip.
+// cancel_requested is not part of the JobRun model (it's a Job column),
+// so we splice it in here at the API boundary.
+type heartbeatResponse struct {
+	model.JobRun
+	CancelRequested bool `json:"cancel_requested"`
+}
+
 func HeartbeatRun(c *gin.Context) {
 	var req heartbeatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	run, err := service.Heartbeat(c.Param("id"), req.WorkerID, service.ProgressUpdate{
+	run, cancelRequested, err := service.Heartbeat(c.Param("id"), req.WorkerID, service.ProgressUpdate{
 		Current: req.ProgressCurrent,
 		Total:   req.ProgressTotal,
 		Message: req.ProgressMessage,
@@ -123,7 +133,7 @@ func HeartbeatRun(c *gin.Context) {
 	if respondServiceErr(c, err) {
 		return
 	}
-	c.JSON(http.StatusOK, run)
+	c.JSON(http.StatusOK, heartbeatResponse{JobRun: run, CancelRequested: cancelRequested})
 }
 
 type completeRequest struct {

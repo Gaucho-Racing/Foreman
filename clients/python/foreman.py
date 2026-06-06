@@ -54,6 +54,7 @@ __all__ = [
     "Client",
     "HTTPError",
     "EnqueueResult",
+    "HeartbeatResult",
     "Job",
     "Run",
     "Schedule",
@@ -122,6 +123,19 @@ class Schedule:
     last_job_id: str = ""
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass
+class HeartbeatResult:
+    """Result of ``Client.heartbeat``.
+
+    The updated run plus the parent job's ``cancel_requested`` flag.
+    Workers should observe ``cancel_requested`` on each heartbeat and
+    wrap up promptly when it flips to True — the Worker abstraction in
+    ``worker.py`` uses this to fire its cancel event.
+    """
+    run: "Run" = field(default_factory=lambda: Run())
+    cancel_requested: bool = False
 
 
 @dataclass
@@ -243,11 +257,16 @@ class Client:
         progress_total: Optional[int] = None,
         progress_message: Optional[str] = None,
         lease_sec: int = 0,
-    ) -> Run:
+    ) -> HeartbeatResult:
         """Extend the lease on the calling worker's in-flight run and
-        optionally report progress. Returns the updated Run."""
+        optionally report progress.
+
+        Returns :class:`HeartbeatResult` carrying the updated run plus
+        the parent job's ``cancel_requested`` flag — observe it on
+        every heartbeat and wrap up promptly when True.
+        """
         if not self.endpoint:
-            return Run()
+            return HeartbeatResult()
         body = _clean({
             "worker_id": worker_id,
             "progress_current": progress_current,
@@ -255,8 +274,12 @@ class Client:
             "progress_message": progress_message,
             "lease_seconds": lease_sec,
         })
-        return _to(Run, self._json("POST", f"/foreman/runs/{run_id}/heartbeat",
-                                   body=body, op="heartbeat"))
+        raw = self._json("POST", f"/foreman/runs/{run_id}/heartbeat",
+                         body=body, op="heartbeat")
+        return HeartbeatResult(
+            run=_to(Run, raw),
+            cancel_requested=bool(raw.get("cancel_requested", False)),
+        )
 
     def complete(self, run_id: str, *, worker_id: str,
                  result: Optional[Any] = None) -> Job:

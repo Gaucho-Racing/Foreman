@@ -99,6 +99,16 @@ type Run struct {
 	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
+// HeartbeatResult is the Heartbeat response: the updated Run plus the
+// parent Job's cancel_requested flag, lifted up here so workers can
+// observe cooperative cancellation on the request they were already
+// sending — no separate GetJob round-trip needed. Run is embedded so
+// callers reach Status / ProgressCurrent / etc. directly off the result.
+type HeartbeatResult struct {
+	Run
+	CancelRequested bool `json:"cancel_requested"`
+}
+
 // Schedule is a recurring (or future one-shot) recipe for enqueuing
 // Jobs. The Foreman scheduler ticks and creates a fresh Job each fire.
 type Schedule struct {
@@ -324,15 +334,16 @@ func (c *Client) Claim(ctx context.Context, req ClaimRequest) (*Claimed, error) 
 }
 
 // Heartbeat extends the lease on the calling worker's in-flight run
-// and optionally reports progress. Returns the updated Run so callers
-// can confirm the new lease.
-func (c *Client) Heartbeat(ctx context.Context, runID string, req HeartbeatRequest) (Run, error) {
+// and optionally reports progress. Returns the updated Run plus the
+// parent job's cancel_requested flag — when true, the handler should
+// wrap up promptly and the Worker abstraction will cancel its context.
+func (c *Client) Heartbeat(ctx context.Context, runID string, req HeartbeatRequest) (HeartbeatResult, error) {
 	if c.disabled() {
-		return Run{}, nil
+		return HeartbeatResult{}, nil
 	}
-	var out Run
+	var out HeartbeatResult
 	if err := c.simpleJSON(ctx, http.MethodPost, "/foreman/runs/"+runID+"/heartbeat", req, &out, "heartbeat"); err != nil {
-		return Run{}, err
+		return HeartbeatResult{}, err
 	}
 	return out, nil
 }

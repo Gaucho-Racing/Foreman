@@ -151,9 +151,12 @@ func TestHeartbeat_ExtendsLeaseAndProgress(t *testing.T) {
 	res := mustClaimNew(t, "k", "w-1")
 	cur := int64(7)
 	tot := int64(10)
-	run, err := Heartbeat(res.Run.ID, "w-1", ProgressUpdate{Current: &cur, Total: &tot}, 30)
+	run, cancelRequested, err := Heartbeat(res.Run.ID, "w-1", ProgressUpdate{Current: &cur, Total: &tot}, 30)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cancelRequested {
+		t.Fatalf("cancel_requested should default false on fresh job")
 	}
 	if run.ProgressCurrent != 7 || run.ProgressTotal != 10 {
 		t.Fatalf("progress: %d/%d", run.ProgressCurrent, run.ProgressTotal)
@@ -166,9 +169,37 @@ func TestHeartbeat_ExtendsLeaseAndProgress(t *testing.T) {
 func TestHeartbeat_WrongWorkerNotOwned(t *testing.T) {
 	resetDB(t)
 	res := mustClaimNew(t, "k", "w-1")
-	_, err := Heartbeat(res.Run.ID, "different-worker", ProgressUpdate{}, 30)
+	_, _, err := Heartbeat(res.Run.ID, "different-worker", ProgressUpdate{}, 30)
 	if !errors.Is(err, ErrNotOwned) {
 		t.Fatalf("err=%v, want ErrNotOwned", err)
+	}
+}
+
+// TestHeartbeat_SurfacesCancelRequested: workers observe cooperative
+// cancel via the heartbeat response. After Cancel() flips the parent
+// job's cancel_requested, the next Heartbeat returns true. This is the
+// signal the Worker abstraction uses to cancel handler contexts.
+func TestHeartbeat_SurfacesCancelRequested(t *testing.T) {
+	resetDB(t)
+	res := mustClaimNew(t, "k", "w-1")
+
+	// Pre-cancel: false.
+	_, cancelRequested, err := Heartbeat(res.Run.ID, "w-1", ProgressUpdate{}, 30)
+	if err != nil || cancelRequested {
+		t.Fatalf("pre-cancel: err=%v cancelRequested=%v", err, cancelRequested)
+	}
+
+	if _, err := Cancel(res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Post-cancel: true.
+	_, cancelRequested, err = Heartbeat(res.Run.ID, "w-1", ProgressUpdate{}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cancelRequested {
+		t.Fatal("post-cancel: heartbeat should surface cancel_requested=true")
 	}
 }
 
@@ -292,6 +323,41 @@ func TestCancel_ActiveSetsCancelRequested(t *testing.T) {
 	}
 	if out.Status != model.StatusActive {
 		t.Fatalf("status=%s (active stays active until worker observes the flag)", out.Status)
+	}
+}
+
+// TestFail_OnCancelRequestedTerminalizesAsCancelled: when a worker
+// fails its run on a job that has cancel_requested=true, the job
+// terminalizes as 'cancelled' (not 'failed'), regardless of retries
+// left or the retryable hint. Cancel intent wins.
+func TestFail_OnCancelRequestedTerminalizesAsCancelled(t *testing.T) {
+	resetDB(t)
+	_ = mustEnqueue(t, "k", withMaxAttempts(5)) // plenty of retries left
+	res, _, _ := Claim(ClaimParams{Kinds: []string{"k"}, WorkerID: "w-1", LeaseSec: 30})
+
+	// Request cancellation on the active job.
+	if _, err := Cancel(res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker observed cancel_requested (via heartbeat in the real
+	// flow) and Failed the run, even with retryable=true.
+	out, err := Fail(res.Run.ID, "w-1", "context canceled", true, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != model.StatusCancelled {
+		t.Fatalf("status=%s, want cancelled (cancel intent should beat retry)", out.Status)
+	}
+	if out.CompletedAt == nil {
+		t.Fatal("cancelled job should have completed_at")
+	}
+
+	// The run itself is still 'failed' (it failed from the worker's
+	// perspective) — only the parent job became 'cancelled'.
+	runs, _ := ListRuns(res.Job.ID)
+	if len(runs) != 1 || runs[0].Status != model.RunStatusFailed {
+		t.Fatalf("expected 1 failed run, got %d runs status=%v", len(runs), runs)
 	}
 }
 
