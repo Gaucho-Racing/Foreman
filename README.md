@@ -124,6 +124,17 @@ service/     enqueue/claim/heartbeat/complete/fail + reaper
 pkg/logger/  zap setup
 ```
 
+## Releasing
+
+```sh
+make release V=0.2.0     # or: ./scripts/release.sh 0.2.0
+```
+
+Preflights main + clean tree, bumps `Version` in `config/config.go`,
+commits, tags `v0.2.0`, pushes, and cuts the GitHub release. The build
+workflow picks up the tag and publishes `ghcr.io/gaucho-racing/foreman`
+at `:0.2.0`, `:0.2`, and `:0` — pin at whichever specificity you want.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
