@@ -215,47 +215,77 @@ func FireSchedule(id string) (model.Job, error) {
 
 // ---------- Tick (called by the scheduler goroutine) ----------
 
+// schedulerLockKey is a fixed Postgres advisory lock key shared by every
+// Foreman replica's scheduler. Whichever replica's transaction acquires
+// it first owns the tick; the rest see false and skip. The value is the
+// ASCII bytes of "foreman" packed into an int64 — stable, unlikely to
+// collide with anyone else's advisory locks in the same database.
+const schedulerLockKey int64 = 0x666f72656d616e
+
 // Tick finds due schedules and enqueues a job for each, advancing
 // NextFireAt past now() so a single delay or crash doesn't replay the
 // entire backlog. Returns how many schedules fired.
 //
-// Each schedule is locked FOR UPDATE SKIP LOCKED so concurrent
-// scheduler instances (multi-replica) don't fire the same one twice.
-// Idempotency key on the enqueue closes the remaining race window: if
-// a scheduler crashes after enqueuing but before updating
-// next_fire_at, the next tick sees the stale next_fire_at and tries to
-// enqueue again — the unique idempotency_key catches the duplicate
-// and we advance past it.
+// Multi-replica safety has two layers:
+//
+//  1. pg_try_advisory_xact_lock at the top of every tick. Only one
+//     replica's tick body runs at a time; the others get false from
+//     the try-lock and no-op. The lock is transaction-scoped, so it
+//     auto-releases at commit — no babysitting needed.
+//  2. Even if the lock layer ever fails (or someone hits the path
+//     manually), each schedule is still selected FOR UPDATE SKIP
+//     LOCKED, and the per-fire idempotency key collapses a crash
+//     retry to the same Job. The advisory lock is the cheap fence;
+//     the row lock + idempotency key is the correctness floor.
 func Tick() (int, error) {
 	const batchLimit = 100
 	now := time.Now()
 	fired := 0
 
-	var dueIDs []string
-	if err := database.DB.Model(&model.Schedule{}).
-		Where("enabled = ? AND next_fire_at <= ?", true, now).
-		Order("next_fire_at ASC").
-		Limit(batchLimit).
-		Pluck("id", &dueIDs).Error; err != nil {
-		return 0, err
-	}
-	if len(dueIDs) == 0 {
-		return 0, nil
-	}
-
-	for _, id := range dueIDs {
-		if err := fireOne(id, now); err != nil {
-			// Don't abort the whole batch — log via the caller and
-			// keep going. A poison schedule shouldn't starve the rest.
-			return fired, fmt.Errorf("schedule %s: %w", id, err)
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var acquired bool
+		if err := tx.Raw("SELECT pg_try_advisory_xact_lock(?)", schedulerLockKey).Scan(&acquired).Error; err != nil {
+			return err
 		}
-		fired++
-	}
-	return fired, nil
+		if !acquired {
+			// Another replica is running this tick. Quietly skip —
+			// flooding logs with one line per replica per second adds
+			// up fast.
+			return nil
+		}
+
+		var dueIDs []string
+		if err := tx.Model(&model.Schedule{}).
+			Where("enabled = ? AND next_fire_at <= ?", true, now).
+			Order("next_fire_at ASC").
+			Limit(batchLimit).
+			Pluck("id", &dueIDs).Error; err != nil {
+			return err
+		}
+		if len(dueIDs) == 0 {
+			return nil
+		}
+
+		for _, id := range dueIDs {
+			if err := fireOneInTx(tx, id, now); err != nil {
+				// Don't abort the whole batch — return now would
+				// rollback all the fires we already did and waste
+				// this tick's lock window. Log and keep going via the
+				// caller; a poison schedule shouldn't starve the rest.
+				return fmt.Errorf("schedule %s: %w", id, err)
+			}
+			fired++
+		}
+		return nil
+	})
+	return fired, err
 }
 
-func fireOne(id string, now time.Time) error {
-	return database.DB.Transaction(func(tx *gorm.DB) error {
+// fireOneInTx is the per-schedule work. Runs inside the tick's wrapper
+// transaction; uses a savepoint via tx.Transaction so a single failure
+// doesn't unwind the whole batch + advisory lock.
+func fireOneInTx(parent *gorm.DB, id string, now time.Time) error {
+	return parent.Transaction(func(tx *gorm.DB) error {
 		var s model.Schedule
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("id = ? AND enabled = ? AND next_fire_at <= ?", id, true, now).
