@@ -110,6 +110,8 @@ Full route list: see `api/api.go`.
 | `DATABASE_PASSWORD`              | `password`  | Password. |
 | `FOREMAN_REAPER_INTERVAL_SEC`    | `10`        | Reaper sweep cadence. |
 | `FOREMAN_DEFAULT_LEASE_SEC`      | `60`        | Lease length when claim omits one. |
+| `FOREMAN_SCHEDULER_INTERVAL_SEC` | `1`         | Scheduler tick cadence. |
+| `FOREMAN_RETENTION_DAYS`         | `0`         | Delete terminal jobs older than this (0 = keep forever). |
 
 ## Layout
 

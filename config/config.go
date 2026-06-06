@@ -42,6 +42,13 @@ var DefaultLeaseSec int
 var SchedulerIntervalRaw = os.Getenv("FOREMAN_SCHEDULER_INTERVAL_SEC")
 var SchedulerIntervalSec int
 
+// RetentionDays prunes terminal jobs (succeeded/failed/cancelled)
+// older than this many days. Zero (the default) disables retention —
+// rows accumulate forever. Cleanup happens inside the reaper loop;
+// FK CASCADE means deleting a job auto-deletes its runs.
+var RetentionDaysRaw = os.Getenv("FOREMAN_RETENTION_DAYS")
+var RetentionDays int
+
 var Env = os.Getenv("ENV")
 var Port = os.Getenv("PORT")
 

@@ -24,6 +24,7 @@ services:
       DATABASE_PASSWORD: "password"
       FOREMAN_REAPER_INTERVAL_SEC: "10"
       FOREMAN_DEFAULT_LEASE_SEC: "60"
+      FOREMAN_RETENTION_DAYS: "0"
 
   db:
     container_name: foreman-db
