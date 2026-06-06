@@ -39,6 +39,9 @@ func Verify() {
 	ReaperIntervalSec = intEnv(ReaperIntervalRaw, "FOREMAN_REAPER_INTERVAL_SEC", 10)
 	DefaultLeaseSec = intEnv(DefaultLeaseRaw, "FOREMAN_DEFAULT_LEASE_SEC", 60)
 	SchedulerIntervalSec = intEnv(SchedulerIntervalRaw, "FOREMAN_SCHEDULER_INTERVAL_SEC", 1)
+	// 0 disables — accept that explicitly so the default behavior is
+	// "keep forever," matching what existed before this knob.
+	RetentionDays = intEnv(RetentionDaysRaw, "FOREMAN_RETENTION_DAYS", 0)
 }
 
 func intEnv(raw, name string, def int) int {

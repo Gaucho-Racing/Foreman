@@ -13,6 +13,11 @@ import (
 // crashed or stalled). Each abandoned run flips its parent job back to
 // pending if attempts remain, or terminalizes it as failed if exhausted.
 //
+// Also opportunistically prunes terminal jobs older than
+// FOREMAN_RETENTION_DAYS (when set). Retention runs every tick — it's
+// a cheap DELETE, and the FK CASCADE on job_runs.job_id sweeps the
+// run history alongside the parent job in the same statement.
+//
 // Replicas that boot together (e.g. during a rolling deploy) would
 // otherwise tick in lockstep, multiplying redundant CTE attempts by N.
 // A random 0..interval offset before the first sweep spreads them
@@ -20,7 +25,8 @@ import (
 func StartReaper() {
 	interval := time.Duration(config.ReaperIntervalSec) * time.Second
 	jitter := time.Duration(rand.Int64N(int64(interval)))
-	logger.SugarLogger.Infof("[REAPER] starting (tick=%s, initial jitter=%s)", interval, jitter)
+	logger.SugarLogger.Infof("[REAPER] starting (tick=%s, initial jitter=%s, retention_days=%d)",
+		interval, jitter, config.RetentionDays)
 	go func() {
 		time.Sleep(jitter)
 		for {
@@ -29,9 +35,29 @@ func StartReaper() {
 			} else if n > 0 {
 				logger.SugarLogger.Warnf("[REAPER] reclaimed %d expired lease(s)", n)
 			}
+			if config.RetentionDays > 0 {
+				if n, err := pruneOldJobs(config.RetentionDays); err != nil {
+					logger.SugarLogger.Errorf("[REAPER] retention sweep failed: %v", err)
+				} else if n > 0 {
+					logger.SugarLogger.Infof("[REAPER] retention deleted %d terminal job(s)", n)
+				}
+			}
 			time.Sleep(interval)
 		}
 	}()
+}
+
+// pruneOldJobs deletes terminal jobs older than `days` days. Schedules
+// and in-flight jobs are untouched — only completed history goes.
+// FK CASCADE on job_runs.job_id auto-deletes corresponding runs.
+func pruneOldJobs(days int) (int64, error) {
+	sql := `
+		DELETE FROM jobs
+		WHERE status IN ('succeeded','failed','cancelled')
+		  AND completed_at IS NOT NULL
+		  AND completed_at < now() - (? || ' days')::interval;`
+	res := database.DB.Exec(sql, days)
+	return res.RowsAffected, res.Error
 }
 
 // reapExpired runs as a single CTE: the inner UPDATE abandons every
