@@ -36,8 +36,10 @@ type Schedule struct {
 
 	Enabled bool `json:"enabled" gorm:"not null;default:true;index"`
 
-	// Operational state — updated by the scheduler on each fire.
-	NextFireAt time.Time  `json:"next_fire_at" gorm:"index;not null"`
+	// Operational state — updated by the scheduler on each fire. The
+	// supporting index is partial on enabled=true (created in
+	// database.applySchemaExtensions); GORM tags can't express that.
+	NextFireAt time.Time  `json:"next_fire_at" gorm:"not null"`
 	LastFireAt *time.Time `json:"last_fire_at,omitempty"`
 	LastJobID  string     `json:"last_job_id,omitempty"`
 
