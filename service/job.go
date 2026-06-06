@@ -193,10 +193,10 @@ type ProgressUpdate struct {
 }
 
 // Heartbeat extends the lease on the calling worker's in-flight run and
-// optionally writes progress. Touches only job_runs — the parent job's
-// shape doesn't change just because a worker pinged. Returns the updated
-// run so the worker can confirm its lease.
-func Heartbeat(jobID, workerID string, prog ProgressUpdate, leaseSec int) (model.JobRun, error) {
+// optionally writes progress. Identifies the run by id (not job id) —
+// workers received the run id from Claim and use it for every
+// lease-scoped mutation. Touches only job_runs.
+func Heartbeat(runID, workerID string, prog ProgressUpdate, leaseSec int) (model.JobRun, error) {
 	if leaseSec <= 0 {
 		leaseSec = config.DefaultLeaseSec
 	}
@@ -212,28 +212,28 @@ func Heartbeat(jobID, workerID string, prog ProgressUpdate, leaseSec int) (model
 	var run model.JobRun
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND worker_id = ? AND status = ?",
-				jobID, workerID, model.RunStatusRunning).
+			Where("id = ? AND worker_id = ? AND status = ?",
+				runID, workerID, model.RunStatusRunning).
 			Updates(updates)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return notRunningErr(jobID)
+			return notRunningRunErr(runID)
 		}
-		return tx.Where("job_id = ? AND worker_id = ? AND status = ?",
-			jobID, workerID, model.RunStatusRunning).
-			First(&run).Error
+		return tx.Where("id = ?", runID).First(&run).Error
 	})
 	return run, err
 }
 
 // ---------- Complete ----------
 
-// Complete closes out the calling worker's in-flight run as succeeded and
-// terminalizes the parent job. The result is denormed onto Job.Result so
-// list views can render outcomes without joining.
-func Complete(jobID, workerID string, result model.JSON) (model.Job, error) {
+// Complete closes out the calling worker's in-flight run as succeeded
+// and terminalizes the parent job. The run id is the addressable handle
+// (workers got it from Claim); the parent job_id is read off the run row
+// so callers don't have to pass it twice. The result is denormed onto
+// Job.Result so list views can render outcomes without joining.
+func Complete(runID, workerID string, result model.JSON) (model.Job, error) {
 	now := time.Now()
 	var job model.Job
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
@@ -247,14 +247,21 @@ func Complete(jobID, workerID string, result model.JSON) (model.Job, error) {
 			runUpdates["result"] = result
 		}
 		res := tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND worker_id = ? AND status = ?",
-				jobID, workerID, model.RunStatusRunning).
+			Where("id = ? AND worker_id = ? AND status = ?",
+				runID, workerID, model.RunStatusRunning).
 			Updates(runUpdates)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return notRunningErr(jobID)
+			return notRunningRunErr(runID)
+		}
+
+		// The just-updated run row carries the parent job_id; read it
+		// back so we don't have to pass it through the API.
+		var run model.JobRun
+		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
+			return err
 		}
 
 		jobUpdates := map[string]any{
@@ -265,10 +272,10 @@ func Complete(jobID, workerID string, result model.JSON) (model.Job, error) {
 		if result != nil {
 			jobUpdates["result"] = result
 		}
-		if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(jobUpdates).Error; err != nil {
+		if err := tx.Model(&model.Job{}).Where("id = ?", run.JobID).Updates(jobUpdates).Error; err != nil {
 			return err
 		}
-		return tx.Where("id = ?", jobID).First(&job).Error
+		return tx.Where("id = ?", run.JobID).First(&job).Error
 	})
 	return job, err
 }
@@ -277,33 +284,46 @@ func Complete(jobID, workerID string, result model.JSON) (model.Job, error) {
 
 // Fail closes out the calling worker's in-flight run as failed and
 // decides whether the parent job retries (status -> pending with backoff)
-// or terminalizes (status -> failed). The run row stays immutable
-// history either way.
-func Fail(jobID, workerID, errMsg string, retryable bool, backoff time.Duration) (model.Job, error) {
+// or terminalizes (status -> failed). An optional result payload is
+// preserved on the run alongside the error — useful for failures that
+// still want to surface partial data (e.g. "processed 50/100, then
+// these specific records errored"). The run row stays immutable history
+// either way; Job.result is *not* touched on Fail (it remains the
+// winning run's result, if any).
+func Fail(runID, workerID, errMsg string, retryable bool, backoff time.Duration, result model.JSON) (model.Job, error) {
 	now := time.Now()
 	var job model.Job
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		runUpdates := map[string]any{
+			"status":           model.RunStatusFailed,
+			"error":            errMsg,
+			"finished_at":      now,
+			"lease_expires_at": nil,
+			"updated_at":       now,
+		}
+		if result != nil {
+			runUpdates["result"] = result
+		}
 		runRes := tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND worker_id = ? AND status = ?",
-				jobID, workerID, model.RunStatusRunning).
-			Updates(map[string]any{
-				"status":           model.RunStatusFailed,
-				"error":            errMsg,
-				"finished_at":      now,
-				"lease_expires_at": nil,
-				"updated_at":       now,
-			})
+			Where("id = ? AND worker_id = ? AND status = ?",
+				runID, workerID, model.RunStatusRunning).
+			Updates(runUpdates)
 		if runRes.Error != nil {
 			return runRes.Error
 		}
 		if runRes.RowsAffected == 0 {
-			return notRunningErr(jobID)
+			return notRunningRunErr(runID)
+		}
+
+		var run model.JobRun
+		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
+			return err
 		}
 
 		// Lock the job to make the retry-vs-terminal decision atomic
 		// with the run closeout.
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", jobID).First(&job).Error; err != nil {
+			Where("id = ?", run.JobID).First(&job).Error; err != nil {
 			return err
 		}
 
@@ -315,10 +335,10 @@ func Fail(jobID, workerID, errMsg string, retryable bool, backoff time.Duration)
 			jobUpdates["status"] = model.StatusFailed
 			jobUpdates["completed_at"] = now
 		}
-		if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(jobUpdates).Error; err != nil {
+		if err := tx.Model(&model.Job{}).Where("id = ?", run.JobID).Updates(jobUpdates).Error; err != nil {
 			return err
 		}
-		return tx.Where("id = ?", jobID).First(&job).Error
+		return tx.Where("id = ?", run.JobID).First(&job).Error
 	})
 	return job, err
 }
@@ -455,12 +475,100 @@ func applyProgress(updates map[string]any, prog ProgressUpdate) {
 	}
 }
 
-// notRunningErr disambiguates a zero-row mutation on the in-flight run:
-// a missing parent job is ErrNotFound, an existing-but-not-owned (or
-// already-terminal) run is ErrNotOwned.
+// notRunningErr disambiguates a zero-row mutation when the caller
+// addressed by job id: a missing job is ErrNotFound, anything else
+// (cancelled/terminalized/wrong worker) is ErrNotOwned.
 func notRunningErr(id string) error {
 	if _, err := Get(id); errors.Is(err, ErrNotFound) {
 		return ErrNotFound
 	}
 	return ErrNotOwned
+}
+
+// notRunningRunErr is the run-addressed equivalent. A missing run id is
+// ErrNotFound; an existing-but-not-owned (terminal/wrong worker) run is
+// ErrNotOwned.
+func notRunningRunErr(runID string) error {
+	var r model.JobRun
+	if err := database.DB.Where("id = ?", runID).First(&r).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return ErrNotOwned
+}
+
+// GetRun returns a single run by id.
+func GetRun(runID string) (model.JobRun, error) {
+	var run model.JobRun
+	if err := database.DB.Where("id = ?", runID).First(&run).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.JobRun{}, ErrNotFound
+		}
+		return model.JobRun{}, err
+	}
+	return run, nil
+}
+
+// ListRunsFilter is the query shape for GET /foreman/runs — a global
+// view across all jobs. Filter by run-level fields (status, worker, the
+// owning job id) plus kind via a join to jobs.
+type ListRunsFilter struct {
+	Status   string
+	WorkerID string
+	JobID    string
+	Kind     string
+	Limit    int
+	Cursor   string // run id; returns rows older than this (keyset on id desc)
+}
+
+// ListAllRuns returns runs across the whole queue with optional filters.
+// Joins to jobs only when Kind is set — most callers won't need it.
+func ListAllRuns(f ListRunsFilter) ([]model.JobRun, error) {
+	q := database.DB.Model(&model.JobRun{})
+	if f.Status != "" {
+		q = q.Where("job_runs.status = ?", f.Status)
+	}
+	if f.WorkerID != "" {
+		q = q.Where("worker_id = ?", f.WorkerID)
+	}
+	if f.JobID != "" {
+		q = q.Where("job_id = ?", f.JobID)
+	}
+	if f.Kind != "" {
+		q = q.Joins("JOIN jobs ON jobs.id = job_runs.job_id").
+			Where("jobs.kind = ?", f.Kind)
+	}
+	if f.Cursor != "" {
+		q = q.Where("job_runs.id < ?", f.Cursor)
+	}
+	limit := f.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var runs []model.JobRun
+	err := q.Order("job_runs.id DESC").Limit(limit).Find(&runs).Error
+	return runs, err
+}
+
+// CurrentRunsForJobs batches CurrentRun across many jobs in a single
+// query. Returns a map keyed by job_id; missing jobs simply have no
+// entry. Used by the jobs-list ?include=current_run expansion.
+func CurrentRunsForJobs(jobIDs []string) (map[string]model.JobRun, error) {
+	out := make(map[string]model.JobRun, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return out, nil
+	}
+	var runs []model.JobRun
+	err := database.DB.
+		Where("job_id IN ? AND status = ?", jobIDs, model.RunStatusRunning).
+		Find(&runs).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range runs {
+		out[r.JobID] = r
+	}
+	return out, nil
 }

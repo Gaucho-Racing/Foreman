@@ -38,18 +38,27 @@ func InitializeRoutes(router *gin.Engine) {
 	p := config.Service.PathPrefix()
 	router.GET(fmt.Sprintf("/%s/ping", p), Ping)
 
-	// All endpoints are public for now — service-to-service auth was
-	// ripped out for fast iteration. Re-introduce a middleware guard
-	// (and re-add a Group + .Use(...) for the write endpoints) when
-	// we want to lock this back down.
+	// All endpoints are public for now — no auth layer. Re-add a
+	// RequireToken middleware and a Group + .Use(...) for the writes
+	// when locking down for shared deployments.
+
+	// Job-scoped resources
+	router.POST(fmt.Sprintf("/%s/jobs", p), EnqueueJob)
 	router.GET(fmt.Sprintf("/%s/jobs", p), ListJobs)
+	// Static "claim" before the :id wildcard so gin's router prefers it
+	// for the literal path. Gin's tree handles this correctly when both
+	// are registered, but order doesn't hurt.
+	router.POST(fmt.Sprintf("/%s/jobs/claim", p), ClaimJob)
 	router.GET(fmt.Sprintf("/%s/jobs/:id", p), GetJob)
 	router.GET(fmt.Sprintf("/%s/jobs/:id/runs", p), ListJobRuns)
-	router.GET(fmt.Sprintf("/%s/events/:id", p), StreamJobEvents)
-	router.POST(fmt.Sprintf("/%s/jobs", p), EnqueueJob)
-	router.POST(fmt.Sprintf("/%s/claim", p), ClaimJob)
-	router.POST(fmt.Sprintf("/%s/jobs/:id/heartbeat", p), HeartbeatJob)
-	router.POST(fmt.Sprintf("/%s/jobs/:id/complete", p), CompleteJob)
-	router.POST(fmt.Sprintf("/%s/jobs/:id/fail", p), FailJob)
+	router.GET(fmt.Sprintf("/%s/jobs/:id/events", p), StreamJobEvents)
 	router.POST(fmt.Sprintf("/%s/jobs/:id/cancel", p), CancelJob)
+
+	// Run-scoped resources. Workers act on the run they own — the run
+	// id is what came back from /jobs/claim — not on the parent job.
+	router.GET(fmt.Sprintf("/%s/runs", p), ListAllRuns)
+	router.GET(fmt.Sprintf("/%s/runs/:id", p), GetRun)
+	router.POST(fmt.Sprintf("/%s/runs/:id/heartbeat", p), HeartbeatRun)
+	router.POST(fmt.Sprintf("/%s/runs/:id/complete", p), CompleteRun)
+	router.POST(fmt.Sprintf("/%s/runs/:id/fail", p), FailRun)
 }
