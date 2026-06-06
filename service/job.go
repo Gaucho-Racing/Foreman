@@ -21,10 +21,13 @@ var (
 	// ErrNotFound is returned when no job matches the given id.
 	ErrNotFound = errors.New("job not found")
 	// ErrNotOwned is returned by lease-scoped mutations (heartbeat,
-	// complete, fail) when the job is no longer running under the calling
-	// worker — it was reclaimed by the reaper, cancelled, or finished.
+	// complete, fail) when the calling worker does not hold a running
+	// JobRun for this job — it was reclaimed by the reaper, cancelled,
+	// or already terminalized.
 	ErrNotOwned = errors.New("job not running under this worker")
 )
+
+// ---------- Enqueue ----------
 
 type EnqueueParams struct {
 	Kind           string
@@ -35,12 +38,6 @@ type EnqueueParams struct {
 	Priority       int
 	MaxAttempts    int
 	ScheduledAt    *time.Time
-}
-
-type ProgressUpdate struct {
-	Current *int64
-	Total   *int64
-	Message *string
 }
 
 func Enqueue(p EnqueueParams) (model.Job, error) {
@@ -59,12 +56,12 @@ func enqueueTx(tx *gorm.DB, p EnqueueParams) (model.Job, error) {
 		Kind:           p.Kind,
 		Queue:          p.Queue,
 		Service:        p.Service,
-		Status:         model.StatusPending,
 		IdempotencyKey: p.IdempotencyKey,
 		Params:         p.Params,
 		Priority:       p.Priority,
 		MaxAttempts:    p.MaxAttempts,
 		ScheduledAt:    p.ScheduledAt,
+		Status:         model.StatusPending,
 	}
 
 	if p.IdempotencyKey == nil {
@@ -99,6 +96,8 @@ func getByIdempotency(tx *gorm.DB, kind, key string) (model.Job, error) {
 	return job, nil
 }
 
+// ---------- Claim ----------
+
 type ClaimParams struct {
 	Kinds    []string
 	Queues   []string
@@ -106,14 +105,23 @@ type ClaimParams struct {
 	LeaseSec int
 }
 
-// Claim atomically leases the highest-priority eligible pending job to the
-// caller using SELECT ... FOR UPDATE SKIP LOCKED, so concurrent workers
-// never grab the same job. The same transaction inserts a JobRun row, so
-// each attempt is recorded the moment it starts — not retroactively.
-// Returns (job, true) on success or (_, false) when nothing is claimable.
-func Claim(p ClaimParams) (model.Job, bool, error) {
+// ClaimResult is what a worker gets back when a claim succeeds: the job
+// definition plus the freshly-minted JobRun the worker now owns.
+type ClaimResult struct {
+	Job model.Job
+	Run model.JobRun
+}
+
+// Claim atomically leases the highest-priority eligible pending job using
+// SELECT … FOR UPDATE SKIP LOCKED, then inserts the JobRun for this
+// attempt in the same transaction. Returns (result, true) on success,
+// (_, false) when nothing is claimable.
+func Claim(p ClaimParams) (ClaimResult, bool, error) {
 	if len(p.Kinds) == 0 {
-		return model.Job{}, false, nil
+		return ClaimResult{}, false, nil
+	}
+	if p.WorkerID == "" {
+		return ClaimResult{}, false, errors.New("worker_id is required")
 	}
 	if p.LeaseSec <= 0 {
 		p.LeaseSec = config.DefaultLeaseSec
@@ -121,21 +129,22 @@ func Claim(p ClaimParams) (model.Job, bool, error) {
 	now := time.Now()
 	lease := now.Add(time.Duration(p.LeaseSec) * time.Second)
 
+	// The atomic claim. Note we increment attempt_count and flip status
+	// here — but we do NOT write worker / lease / progress to the job
+	// row; those live on the JobRun we create next.
 	sql := `
 		UPDATE jobs SET
-			status = 'running',
-			worker_id = ?,
-			attempt = attempt + 1,
-			lease_expires_at = ?,
-			started_at = COALESCE(started_at, now()),
-			updated_at = now()
+			status        = 'active',
+			attempt_count = attempt_count + 1,
+			started_at    = COALESCE(started_at, now()),
+			updated_at    = now()
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE status = 'pending'
 			  AND kind IN ?
 			  AND (? OR queue IN ?)
 			  AND (scheduled_at IS NULL OR scheduled_at <= now())
-			ORDER BY priority DESC, created_at ASC
+			ORDER BY priority DESC, enqueued_at ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
@@ -147,101 +156,87 @@ func Claim(p ClaimParams) (model.Job, bool, error) {
 		queues = []string{""} // placeholder; guarded by the boolean
 	}
 
-	var job model.Job
+	var out ClaimResult
 	var found bool
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		res := tx.Raw(sql, p.WorkerID, lease, p.Kinds, noQueueFilter, queues).Scan(&job)
+		res := tx.Raw(sql, p.Kinds, noQueueFilter, queues).Scan(&out.Job)
 		if res.Error != nil {
 			return res.Error
 		}
-		if res.RowsAffected == 0 || job.ID == "" {
+		if res.RowsAffected == 0 || out.Job.ID == "" {
 			return nil
 		}
 		found = true
-		run := model.JobRun{
+		out.Run = model.JobRun{
 			ID:             ulid.Make().Prefixed("run"),
-			JobID:          job.ID,
-			Attempt:        job.Attempt,
+			JobID:          out.Job.ID,
+			Attempt:        out.Job.AttemptCount,
 			WorkerID:       p.WorkerID,
 			Status:         model.RunStatusRunning,
 			LeaseExpiresAt: &lease,
 			StartedAt:      now,
 		}
-		return tx.Create(&run).Error
+		return tx.Create(&out.Run).Error
 	})
 	if err != nil {
-		return model.Job{}, false, err
+		return ClaimResult{}, false, err
 	}
-	return job, found, nil
+	return out, found, nil
 }
 
-func Heartbeat(id, workerID string, prog ProgressUpdate, leaseSec int) (model.Job, error) {
+// ---------- Heartbeat ----------
+
+type ProgressUpdate struct {
+	Current *int64
+	Total   *int64
+	Message *string
+}
+
+// Heartbeat extends the lease on the calling worker's in-flight run and
+// optionally writes progress. Touches only job_runs — the parent job's
+// shape doesn't change just because a worker pinged. Returns the updated
+// run so the worker can confirm its lease.
+func Heartbeat(jobID, workerID string, prog ProgressUpdate, leaseSec int) (model.JobRun, error) {
 	if leaseSec <= 0 {
 		leaseSec = config.DefaultLeaseSec
 	}
 	now := time.Now()
 	lease := now.Add(time.Duration(leaseSec) * time.Second)
 
-	jobUpdates := map[string]any{
+	updates := map[string]any{
 		"lease_expires_at": lease,
 		"updated_at":       now,
 	}
-	applyProgress(jobUpdates, prog)
+	applyProgress(updates, prog)
 
-	var out model.Job
+	var run model.JobRun
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		res := tx.Model(&model.Job{}).
-			Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
-			Updates(jobUpdates)
+		res := tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND worker_id = ? AND status = ?",
+				jobID, workerID, model.RunStatusRunning).
+			Updates(updates)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return notRunningErr(id)
+			return notRunningErr(jobID)
 		}
-		if err := tx.Where("id = ?", id).First(&out).Error; err != nil {
-			return err
-		}
-		runUpdates := map[string]any{
-			"lease_expires_at": lease,
-			"updated_at":       now,
-		}
-		applyProgress(runUpdates, prog)
-		return tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND attempt = ? AND status = ?",
-				id, out.Attempt, model.RunStatusRunning).
-			Updates(runUpdates).Error
+		return tx.Where("job_id = ? AND worker_id = ? AND status = ?",
+			jobID, workerID, model.RunStatusRunning).
+			First(&run).Error
 	})
-	if err != nil {
-		return model.Job{}, err
-	}
-	return out, nil
+	return run, err
 }
 
-func Complete(id, workerID string, result model.JSON) (model.Job, error) {
+// ---------- Complete ----------
+
+// Complete closes out the calling worker's in-flight run as succeeded and
+// terminalizes the parent job. The result is denormed onto Job.Result so
+// list views can render outcomes without joining.
+func Complete(jobID, workerID string, result model.JSON) (model.Job, error) {
 	now := time.Now()
-	jobUpdates := map[string]any{
-		"status":      model.StatusSucceeded,
-		"finished_at": now,
-		"updated_at":  now,
-	}
-	if result != nil {
-		jobUpdates["result"] = result
-	}
-	var out model.Job
+	var job model.Job
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		res := tx.Model(&model.Job{}).
-			Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
-			Updates(jobUpdates)
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected == 0 {
-			return notRunningErr(id)
-		}
-		if err := tx.Where("id = ?", id).First(&out).Error; err != nil {
-			return err
-		}
 		runUpdates := map[string]any{
 			"status":           model.RunStatusSucceeded,
 			"finished_at":      now,
@@ -251,74 +246,95 @@ func Complete(id, workerID string, result model.JSON) (model.Job, error) {
 		if result != nil {
 			runUpdates["result"] = result
 		}
-		return tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND attempt = ? AND status = ?",
-				id, out.Attempt, model.RunStatusRunning).
-			Updates(runUpdates).Error
+		res := tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND worker_id = ? AND status = ?",
+				jobID, workerID, model.RunStatusRunning).
+			Updates(runUpdates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return notRunningErr(jobID)
+		}
+
+		jobUpdates := map[string]any{
+			"status":       model.StatusSucceeded,
+			"completed_at": now,
+			"updated_at":   now,
+		}
+		if result != nil {
+			jobUpdates["result"] = result
+		}
+		if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(jobUpdates).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", jobID).First(&job).Error
 	})
-	if err != nil {
-		return model.Job{}, err
-	}
-	return out, nil
+	return job, err
 }
 
-// Fail records a failed attempt. When retryable and attempts remain, the
-// job returns to pending with a backoff delay; otherwise it is marked
-// failed terminally. Either way, the in-flight JobRun is closed out as
-// status=failed — so a retried job has a clean trail of past attempts.
-func Fail(id, workerID, errMsg string, retryable bool, backoff time.Duration) (model.Job, error) {
+// ---------- Fail ----------
+
+// Fail closes out the calling worker's in-flight run as failed and
+// decides whether the parent job retries (status -> pending with backoff)
+// or terminalizes (status -> failed). The run row stays immutable
+// history either way.
+func Fail(jobID, workerID, errMsg string, retryable bool, backoff time.Duration) (model.Job, error) {
 	now := time.Now()
+	var job model.Job
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		var job model.Job
+		runRes := tx.Model(&model.JobRun{}).
+			Where("job_id = ? AND worker_id = ? AND status = ?",
+				jobID, workerID, model.RunStatusRunning).
+			Updates(map[string]any{
+				"status":           model.RunStatusFailed,
+				"error":            errMsg,
+				"finished_at":      now,
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			})
+		if runRes.Error != nil {
+			return runRes.Error
+		}
+		if runRes.RowsAffected == 0 {
+			return notRunningErr(jobID)
+		}
+
+		// Lock the job to make the retry-vs-terminal decision atomic
+		// with the run closeout.
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND status = ? AND worker_id = ?", id, model.StatusRunning, workerID).
-			First(&job).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrNotOwned
-			}
+			Where("id = ?", jobID).First(&job).Error; err != nil {
 			return err
 		}
 
-		jobUpdates := map[string]any{"error": errMsg, "updated_at": now}
-		if retryable && job.Attempt < job.MaxAttempts {
+		jobUpdates := map[string]any{"updated_at": now}
+		if retryable && job.AttemptCount < job.MaxAttempts {
 			jobUpdates["status"] = model.StatusPending
-			jobUpdates["worker_id"] = ""
-			jobUpdates["lease_expires_at"] = nil
 			jobUpdates["scheduled_at"] = now.Add(backoff)
 		} else {
 			jobUpdates["status"] = model.StatusFailed
-			jobUpdates["finished_at"] = now
+			jobUpdates["completed_at"] = now
 		}
-		if err := tx.Model(&model.Job{}).Where("id = ?", id).Updates(jobUpdates).Error; err != nil {
+		if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(jobUpdates).Error; err != nil {
 			return err
 		}
-		// Close out the in-flight run regardless of whether the parent
-		// job retries — runs are immutable history once terminal.
-		return tx.Model(&model.JobRun{}).
-			Where("job_id = ? AND attempt = ? AND status = ?",
-				id, job.Attempt, model.RunStatusRunning).
-			Updates(map[string]any{
-				"status":           model.RunStatusFailed,
-				"finished_at":      now,
-				"lease_expires_at": nil,
-				"error":            errMsg,
-				"updated_at":       now,
-			}).Error
+		return tx.Where("id = ?", jobID).First(&job).Error
 	})
-	if err != nil {
-		return model.Job{}, err
-	}
-	return Get(id)
+	return job, err
 }
+
+// ---------- Cancel ----------
 
 // Cancel cancels a pending job immediately, or flags a running job for
 // cooperative cancellation (the worker observes cancel_requested on its
-// next heartbeat and stops). Terminal jobs are returned unchanged.
-func Cancel(id string) (model.Job, error) {
+// next heartbeat and stops via Fail). Terminal jobs are returned
+// unchanged.
+func Cancel(jobID string) (model.Job, error) {
+	now := time.Now()
+	var job model.Job
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		var job model.Job
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", id).First(&job).Error; err != nil {
+			Where("id = ?", jobID).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotFound
 			}
@@ -326,25 +342,29 @@ func Cancel(id string) (model.Job, error) {
 		}
 		switch job.Status {
 		case model.StatusPending:
-			return tx.Model(&model.Job{}).Where("id = ?", id).Updates(map[string]any{
-				"status":      model.StatusCancelled,
-				"finished_at": time.Now(),
-				"updated_at":  time.Now(),
-			}).Error
-		case model.StatusRunning:
-			return tx.Model(&model.Job{}).Where("id = ?", id).Updates(map[string]any{
+			if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(map[string]any{
+				"status":       model.StatusCancelled,
+				"completed_at": now,
+				"updated_at":   now,
+			}).Error; err != nil {
+				return err
+			}
+		case model.StatusActive:
+			if err := tx.Model(&model.Job{}).Where("id = ?", jobID).Updates(map[string]any{
 				"cancel_requested": true,
-				"updated_at":       time.Now(),
-			}).Error
+				"updated_at":       now,
+			}).Error; err != nil {
+				return err
+			}
 		default:
 			return nil
 		}
+		return tx.Where("id = ?", jobID).First(&job).Error
 	})
-	if err != nil {
-		return model.Job{}, err
-	}
-	return Get(id)
+	return job, err
 }
+
+// ---------- Reads ----------
 
 func Get(id string) (model.Job, error) {
 	var job model.Job
@@ -357,9 +377,24 @@ func Get(id string) (model.Job, error) {
 	return job, nil
 }
 
-// ListRuns returns every attempt at running the given job, oldest first.
-// Useful for the dashboard and for callers debugging "what went wrong on
-// attempt N".
+// CurrentRun returns the in-flight run for a job, if any. The dashboard
+// uses this to surface "what's happening right now" without bloating the
+// Job row with denorm columns.
+func CurrentRun(jobID string) (*model.JobRun, error) {
+	var run model.JobRun
+	err := database.DB.
+		Where("job_id = ? AND status = ?", jobID, model.RunStatusRunning).
+		First(&run).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &run, nil
+}
+
+// ListRuns returns every attempt at the given job, oldest first.
 func ListRuns(jobID string) ([]model.JobRun, error) {
 	var runs []model.JobRun
 	err := database.DB.
@@ -406,6 +441,8 @@ func List(f ListFilter) ([]model.Job, error) {
 	return jobs, nil
 }
 
+// ---------- helpers ----------
+
 func applyProgress(updates map[string]any, prog ProgressUpdate) {
 	if prog.Current != nil {
 		updates["progress_current"] = *prog.Current
@@ -418,8 +455,9 @@ func applyProgress(updates map[string]any, prog ProgressUpdate) {
 	}
 }
 
-// notRunningErr disambiguates a zero-row lease mutation: a missing job is
-// ErrNotFound, an existing-but-not-owned/terminal job is ErrNotOwned.
+// notRunningErr disambiguates a zero-row mutation on the in-flight run:
+// a missing parent job is ErrNotFound, an existing-but-not-owned (or
+// already-terminal) run is ErrNotOwned.
 func notRunningErr(id string) error {
 	if _, err := Get(id); errors.Is(err, ErrNotFound) {
 		return ErrNotFound

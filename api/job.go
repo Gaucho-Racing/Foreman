@@ -63,7 +63,7 @@ func ClaimJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	job, found, err := service.Claim(service.ClaimParams{
+	res, found, err := service.Claim(service.ClaimParams{
 		Kinds:    req.Kinds,
 		Queues:   req.Queues,
 		WorkerID: req.WorkerID,
@@ -77,7 +77,10 @@ func ClaimJob(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	c.JSON(http.StatusOK, job)
+	// Return the job + the run the worker now owns. Workers need both:
+	// the job for params/kind, the run for the lease + run id (for any
+	// future per-run endpoints).
+	c.JSON(http.StatusOK, gin.H{"job": res.Job, "run": res.Run})
 }
 
 type heartbeatRequest struct {
@@ -94,7 +97,9 @@ func HeartbeatJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	job, err := service.Heartbeat(c.Param("id"), req.WorkerID, service.ProgressUpdate{
+	// Heartbeat touches only the run — return the run so the worker sees
+	// its new lease without having to read it back separately.
+	run, err := service.Heartbeat(c.Param("id"), req.WorkerID, service.ProgressUpdate{
 		Current: req.ProgressCurrent,
 		Total:   req.ProgressTotal,
 		Message: req.ProgressMessage,
@@ -102,7 +107,7 @@ func HeartbeatJob(c *gin.Context) {
 	if respondServiceErr(c, err) {
 		return
 	}
-	c.JSON(http.StatusOK, job)
+	c.JSON(http.StatusOK, run)
 }
 
 type completeRequest struct {

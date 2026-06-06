@@ -5,44 +5,48 @@ import "time"
 const (
 	// RunStatusRunning — the worker is currently leasing this attempt.
 	RunStatusRunning = "running"
-	// RunStatusSucceeded — the worker called Complete.
+	// RunStatusSucceeded — the worker called Complete; Result is set.
 	RunStatusSucceeded = "succeeded"
-	// RunStatusFailed — the worker called Fail. The parent Job may still
-	// be pending (retry) or failed (terminal) depending on retryability.
+	// RunStatusFailed — the worker called Fail; Error is set. The parent
+	// Job may still bounce to pending (retry) or terminalize to failed.
 	RunStatusFailed = "failed"
 	// RunStatusAbandoned — the reaper swept this attempt because its
-	// lease expired without a Complete/Fail. The parent Job is bounced
-	// back to pending (retry) or marked failed (exhausted) — same
-	// branching as Fail, just driven by the reaper.
+	// lease expired without a Complete/Fail. Same parent-job branching
+	// as Failed, just driven by the reaper rather than a worker.
 	RunStatusAbandoned = "abandoned"
 )
 
-// JobRun records one attempt at running a Job. A Job grows one JobRun
-// per claim; the row captures everything the dashboard needs to answer
-// "what happened on this attempt": which worker, when it started and
-// finished, last-known progress, terminal error/result.
+// JobRun is one attempt at running a Job — the source of truth for all
+// transient and per-attempt state: which worker holds the lease, how it
+// progressed, what error or result it ended with. The parent Job points
+// at the *definition*; runs answer "what happened on attempt N".
 //
-// The parent Job continues to carry the latest worker_id / lease /
-// progress as denormalized state so claim + heartbeat don't have to
-// JOIN — JobRun is the audit trail, not the source of truth for "what
-// is this job doing right now".
+// Invariant: at most one row per (job_id, status='running'). Enforced by
+// service logic, not the DB — Postgres can't express partial unique
+// indexes via GORM tags. Composite UNIQUE on (job_id, attempt) catches
+// the broader "one row per attempt".
 type JobRun struct {
 	ID    string `json:"id" gorm:"primaryKey"`
-	JobID string `json:"job_id" gorm:"index;uniqueIndex:idx_job_runs_job_attempt;not null"`
-	// Attempt mirrors Job.Attempt at claim time. Combined with JobID it's
-	// unique — a single claim is one attempt.
-	Attempt  int    `json:"attempt" gorm:"uniqueIndex:idx_job_runs_job_attempt;not null"`
+	JobID string `json:"job_id" gorm:"uniqueIndex:idx_job_runs_job_attempt;not null"`
+	// Attempt is 1-based and increases monotonically per job — set to
+	// Job.AttemptCount at the moment of claim.
+	Attempt int `json:"attempt" gorm:"uniqueIndex:idx_job_runs_job_attempt;not null"`
+
 	WorkerID string `json:"worker_id" gorm:"not null"`
-	Status   string `json:"status" gorm:"index;not null"`
+	Status   string `json:"status" gorm:"not null"`
+
+	// LeaseExpiresAt is meaningful only while status='running'. Reaper
+	// uses this to detect abandoned leases. Set to NULL on any terminal
+	// transition. Indexed for the reaper sweep — terminal rows have NULL
+	// here, so the index naturally covers only in-flight runs.
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty" gorm:"index"`
 
 	ProgressCurrent int64  `json:"progress_current" gorm:"not null;default:0"`
 	ProgressTotal   int64  `json:"progress_total" gorm:"not null;default:0"`
 	ProgressMessage string `json:"progress_message,omitempty"`
 
-	Error  string `json:"error,omitempty"`
 	Result JSON   `json:"result,omitempty" gorm:"type:jsonb"`
-
-	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty" gorm:"index"`
+	Error  string `json:"error,omitempty"`
 
 	StartedAt  time.Time  `json:"started_at" gorm:"not null"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
