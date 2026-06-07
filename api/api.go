@@ -55,8 +55,13 @@ func InitializeRoutes(router *gin.Engine) {
 	router.POST(fmt.Sprintf("/%s/jobs/claim", p), ClaimJob)
 	router.GET(fmt.Sprintf("/%s/jobs/:id", p), GetJob)
 	router.GET(fmt.Sprintf("/%s/jobs/:id/runs", p), ListJobRuns)
-	router.GET(fmt.Sprintf("/%s/jobs/:id/events", p), StreamJobEvents)
 	router.POST(fmt.Sprintf("/%s/jobs/:id/cancel", p), CancelJob)
+
+	// SSE lives at /foreman/events/:id (not under /jobs/) so kerbecs
+	// can keep its separate `foreman-events` route with
+	// envelope:passthrough — bypassing the JSON-envelope wrapping that
+	// would otherwise break the stream.
+	router.GET(fmt.Sprintf("/%s/events/:id", p), StreamJobEvents)
 
 	// Run-scoped resources. Workers act on the run they own — the run
 	// id is what came back from /jobs/claim — not on the parent job.
