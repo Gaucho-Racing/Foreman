@@ -2,8 +2,8 @@
 
 [![Build](https://img.shields.io/github/actions/workflow/status/Gaucho-Racing/Foreman/build.yml?branch=main)](https://github.com/Gaucho-Racing/Foreman/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/Gaucho-Racing/Foreman?label=release)](https://github.com/Gaucho-Racing/Foreman/releases/latest)
-[![Image](https://img.shields.io/badge/ghcr.io-foreman-blue?logo=docker)](https://github.com/Gaucho-Racing/Foreman/pkgs/container/foreman)
-[![License](https://img.shields.io/github/license/Gaucho-Racing/Foreman)](./LICENSE)
+[![Image](https://img.shields.io/badge/ghcr.io-foreman-black?logo=docker)](https://github.com/Gaucho-Racing/Foreman/pkgs/container/foreman)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Lightweight job orchestration backed by Postgres. Producers enqueue jobs
 with an optional idempotency key; workers claim them by kind, lease them,
