@@ -21,7 +21,7 @@ func (s ServiceInfo) PathPrefix() string {
 
 var Service = ServiceInfo{
 	Name:    "Foreman",
-	Version: "2.0.0",
+	Version: "2.0.1",
 }
 
 // All endpoints are public for now — no auth layer. Re-add a
