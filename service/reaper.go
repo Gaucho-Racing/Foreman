@@ -1,11 +1,13 @@
 package service
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"time"
 
 	"github.com/gaucho-racing/foreman/config"
 	"github.com/gaucho-racing/foreman/database"
+	"github.com/gaucho-racing/foreman/model"
 	"github.com/gaucho-racing/foreman/pkg/logger"
 	"github.com/gaucho-racing/foreman/pkg/metrics"
 )
@@ -61,11 +63,11 @@ func StartReaper() {
 // pgx can bind the parameter as an int — the text-concat form forces a
 // text encode of `days` that pgx refuses to plan automatically.
 func pruneOldJobs(days int) (int64, error) {
-	sql := `
-		DELETE FROM jobs
+	sql := fmt.Sprintf(`
+		DELETE FROM %s
 		WHERE status IN ('succeeded','failed','cancelled')
 		  AND completed_at IS NOT NULL
-		  AND completed_at < now() - make_interval(days => ?);`
+		  AND completed_at < now() - make_interval(days => ?);`, model.TableJobs())
 	res := database.DB.Exec(sql, days)
 	return res.RowsAffected, res.Error
 }
@@ -76,9 +78,9 @@ func pruneOldJobs(days int) (int64, error) {
 // writers, and the predicate `status='running' AND lease_expires_at <
 // now()` is shared so the same rows are touched on both sides.
 func reapExpired() (int64, error) {
-	sql := `
+	sql := fmt.Sprintf(`
 		WITH expired AS (
-			UPDATE job_runs SET
+			UPDATE %[1]s SET
 				status           = 'abandoned',
 				finished_at      = now(),
 				error            = COALESCE(NULLIF(error, ''), 'lease expired'),
@@ -89,12 +91,12 @@ func reapExpired() (int64, error) {
 			  AND lease_expires_at < now()
 			RETURNING job_id
 		)
-		UPDATE jobs SET
+		UPDATE %[2]s SET
 			status       = CASE WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
 			scheduled_at = CASE WHEN attempt_count < max_attempts THEN now() ELSE scheduled_at END,
 			completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE completed_at END,
 			updated_at   = now()
-		WHERE id IN (SELECT job_id FROM expired);`
+		WHERE id IN (SELECT job_id FROM expired);`, model.TableJobRuns(), model.TableJobs())
 	res := database.DB.Exec(sql)
 	return res.RowsAffected, res.Error
 }

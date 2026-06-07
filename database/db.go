@@ -47,54 +47,62 @@ func Init() {
 //
 // Order matters: drop the full-table indexes that the partial ones
 // supersede first, so the rebuild doesn't briefly double-index.
+//
+// Constraint and index identifiers carry the same prefix as the tables
+// they're attached to — Postgres constraint names are unique per
+// schema, so unprefixed names would collide if two Foreman instances
+// shared a database with different table prefixes.
 func applySchemaExtensions(db *gorm.DB) error {
+	jobs := model.TableJobs()
+	runs := model.TableJobRuns()
+	scheds := model.TableSchedules()
 	stmts := []string{
 		// --- Constraints ---
 		// FK with cascade so deleting a job auto-deletes its runs.
-		`DO $$ BEGIN
-			ALTER TABLE job_runs
-				ADD CONSTRAINT job_runs_job_id_fkey
-				FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
-		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+		fmt.Sprintf(`DO $$ BEGIN
+			ALTER TABLE %[1]s
+				ADD CONSTRAINT %[1]s_job_id_fkey
+				FOREIGN KEY (job_id) REFERENCES %[2]s(id) ON DELETE CASCADE;
+		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`, runs, jobs),
 
 		// Defensive CHECK on status — catches typos in code before they
 		// reach the row. Trivial to add now, painful to add later if
 		// any stray value ever lands.
-		`DO $$ BEGIN
-			ALTER TABLE jobs
-				ADD CONSTRAINT jobs_status_check
+		fmt.Sprintf(`DO $$ BEGIN
+			ALTER TABLE %[1]s
+				ADD CONSTRAINT %[1]s_status_check
 				CHECK (status IN ('pending','active','succeeded','failed','cancelled'));
-		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`, jobs),
 
-		`DO $$ BEGIN
-			ALTER TABLE job_runs
-				ADD CONSTRAINT job_runs_status_check
+		fmt.Sprintf(`DO $$ BEGIN
+			ALTER TABLE %[1]s
+				ADD CONSTRAINT %[1]s_status_check
 				CHECK (status IN ('running','succeeded','failed','abandoned'));
-		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+		EXCEPTION WHEN duplicate_object THEN NULL; END $$;`, runs),
 
-		// --- Drop superseded full-table indexes ---
-		`DROP INDEX IF EXISTS idx_job_runs_lease_expires_at;`,
-		`DROP INDEX IF EXISTS idx_schedules_next_fire_at;`,
+		// --- Drop superseded full-table indexes (legacy names) ---
+		fmt.Sprintf(`DROP INDEX IF EXISTS idx_%s_lease_expires_at;`, runs),
+		fmt.Sprintf(`DROP INDEX IF EXISTS idx_%s_next_fire_at;`, scheds),
 
 		// --- Partial indexes for the hot paths ---
 		// Claim filters status='pending' (vast minority in steady state)
 		// and orders by priority + enqueued_at. Partial lets the scan
 		// skip terminal rows entirely.
-		`CREATE INDEX IF NOT EXISTS idx_jobs_pending_claim
-			ON jobs (kind, scheduled_at, priority DESC, enqueued_at)
-			WHERE status = 'pending';`,
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_pending_claim
+			ON %[1]s (kind, scheduled_at, priority DESC, enqueued_at)
+			WHERE status = 'pending';`, jobs),
 
 		// Reaper scans job_runs.status='running' AND lease_expires_at <
 		// now(). Partial covers only in-flight runs.
-		`CREATE INDEX IF NOT EXISTS idx_job_runs_running_lease
-			ON job_runs (lease_expires_at)
-			WHERE status = 'running';`,
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_running_lease
+			ON %[1]s (lease_expires_at)
+			WHERE status = 'running';`, runs),
 
 		// Scheduler's pluck is "enabled AND next_fire_at <= now()".
 		// Partial on enabled — disabled schedules just don't appear.
-		`CREATE INDEX IF NOT EXISTS idx_schedules_due
-			ON schedules (next_fire_at)
-			WHERE enabled;`,
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_due
+			ON %[1]s (next_fire_at)
+			WHERE enabled;`, scheds),
 	}
 	for _, s := range stmts {
 		if err := db.Exec(s).Error; err != nil {

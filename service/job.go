@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gaucho-racing/foreman/config"
@@ -141,14 +142,14 @@ func Claim(p ClaimParams) (ClaimResult, bool, error) {
 	// The atomic claim. Note we increment attempt_count and flip status
 	// here — but we do NOT write worker / lease / progress to the job
 	// row; those live on the JobRun we create next.
-	sql := `
-		UPDATE jobs SET
+	sql := fmt.Sprintf(`
+		UPDATE %[1]s SET
 			status        = 'active',
 			attempt_count = attempt_count + 1,
 			started_at    = COALESCE(started_at, now()),
 			updated_at    = now()
 		WHERE id = (
-			SELECT id FROM jobs
+			SELECT id FROM %[1]s
 			WHERE status = 'pending'
 			  AND kind IN ?
 			  AND (? OR queue IN ?)
@@ -157,7 +158,7 @@ func Claim(p ClaimParams) (ClaimResult, bool, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING *;`
+		RETURNING *;`, model.TableJobs())
 
 	noQueueFilter := len(p.Queues) == 0
 	queues := p.Queues
@@ -624,8 +625,10 @@ type ListRunsFilter struct {
 // Joins to jobs only when Kind is set — most callers won't need it.
 func ListAllRuns(f ListRunsFilter) ([]model.JobRun, error) {
 	q := database.DB.Model(&model.JobRun{})
+	runsT := model.TableJobRuns()
+	jobsT := model.TableJobs()
 	if f.Status != "" {
-		q = q.Where("job_runs.status = ?", f.Status)
+		q = q.Where(runsT+".status = ?", f.Status)
 	}
 	if f.WorkerID != "" {
 		q = q.Where("worker_id = ?", f.WorkerID)
@@ -634,18 +637,18 @@ func ListAllRuns(f ListRunsFilter) ([]model.JobRun, error) {
 		q = q.Where("job_id = ?", f.JobID)
 	}
 	if f.Kind != "" {
-		q = q.Joins("JOIN jobs ON jobs.id = job_runs.job_id").
-			Where("jobs.kind = ?", f.Kind)
+		q = q.Joins(fmt.Sprintf("JOIN %[1]s ON %[1]s.id = %[2]s.job_id", jobsT, runsT)).
+			Where(jobsT+".kind = ?", f.Kind)
 	}
 	if f.Cursor != "" {
-		q = q.Where("job_runs.id < ?", f.Cursor)
+		q = q.Where(runsT+".id < ?", f.Cursor)
 	}
 	limit := f.Limit
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	var runs []model.JobRun
-	err := q.Order("job_runs.id DESC").Limit(limit).Find(&runs).Error
+	err := q.Order(runsT + ".id DESC").Limit(limit).Find(&runs).Error
 	return runs, err
 }
 

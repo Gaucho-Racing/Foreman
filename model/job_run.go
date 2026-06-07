@@ -56,7 +56,7 @@ type JobRun struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime;precision:6"`
 }
 
-func (JobRun) TableName() string { return "job_runs" }
+func (JobRun) TableName() string { return TableJobRuns() }
 
 func (r JobRun) IsTerminal() bool {
 	return r.Status == RunStatusSucceeded || r.Status == RunStatusFailed || r.Status == RunStatusAbandoned

@@ -23,10 +23,12 @@ package metrics
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gaucho-racing/foreman/database"
+	"github.com/gaucho-racing/foreman/model"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -235,11 +237,15 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	db := database.DB.WithContext(ctx)
 
+	jobsT := model.TableJobs()
+	runsT := model.TableJobRuns()
+	schedsT := model.TableSchedules()
+
 	// jobs by status — emit every known status even when count=0 so
 	// graphs don't get gaps when a category empties out.
 	knownJobStatuses := []string{"pending", "active", "succeeded", "failed", "cancelled"}
 	jobCounts := map[string]int64{}
-	rows, err := db.Raw("SELECT status, count(*) FROM jobs GROUP BY status").Rows()
+	rows, err := db.Raw(fmt.Sprintf("SELECT status, count(*) FROM %s GROUP BY status", jobsT)).Rows()
 	if err == nil {
 		jobCounts = scanCountMap(rows)
 	}
@@ -249,7 +255,7 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 
 	knownRunStatuses := []string{"running", "succeeded", "failed", "abandoned"}
 	runCounts := map[string]int64{}
-	rows, err = db.Raw("SELECT status, count(*) FROM job_runs GROUP BY status").Rows()
+	rows, err = db.Raw(fmt.Sprintf("SELECT status, count(*) FROM %s GROUP BY status", runsT)).Rows()
 	if err == nil {
 		runCounts = scanCountMap(rows)
 	}
@@ -258,7 +264,7 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	scheduleCounts := map[string]int64{}
-	rows, err = db.Raw("SELECT enabled::text, count(*) FROM schedules GROUP BY enabled").Rows()
+	rows, err = db.Raw(fmt.Sprintf("SELECT enabled::text, count(*) FROM %s GROUP BY enabled", schedsT)).Rows()
 	if err == nil {
 		scheduleCounts = scanCountMap(rows)
 	}
@@ -268,23 +274,23 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 
 	// Scalar gauges. NULL → 0 via COALESCE so we never emit NaN.
 	var oldestPending sql.NullFloat64
-	if err := db.Raw(`
+	if err := db.Raw(fmt.Sprintf(`
 		SELECT EXTRACT(EPOCH FROM (now() - min(enqueued_at)))
-		FROM jobs WHERE status = 'pending'`).Scan(&oldestPending).Error; err == nil {
+		FROM %s WHERE status = 'pending'`, jobsT)).Scan(&oldestPending).Error; err == nil {
 		ch <- prometheus.MustNewConstMetric(c.oldestPendingAge, prometheus.GaugeValue, nullFloat(oldestPending))
 	}
 
 	var overdueLease sql.NullFloat64
-	if err := db.Raw(`
+	if err := db.Raw(fmt.Sprintf(`
 		SELECT EXTRACT(EPOCH FROM (now() - min(lease_expires_at)))
-		FROM job_runs
-		WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now()`).
+		FROM %s
+		WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now()`, runsT)).
 		Scan(&overdueLease).Error; err == nil {
 		ch <- prometheus.MustNewConstMetric(c.overdueLeaseAge, prometheus.GaugeValue, nullFloat(overdueLease))
 	}
 
 	var due int64
-	if err := db.Raw("SELECT count(*) FROM schedules WHERE enabled AND next_fire_at <= now()").
+	if err := db.Raw(fmt.Sprintf("SELECT count(*) FROM %s WHERE enabled AND next_fire_at <= now()", schedsT)).
 		Scan(&due).Error; err == nil {
 		ch <- prometheus.MustNewConstMetric(c.schedulesDue, prometheus.GaugeValue, float64(due))
 	}

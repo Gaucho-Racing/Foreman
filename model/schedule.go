@@ -47,4 +47,4 @@ type Schedule struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime;precision:6"`
 }
 
-func (Schedule) TableName() string { return "schedules" }
+func (Schedule) TableName() string { return TableSchedules() }

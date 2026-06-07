@@ -117,6 +117,7 @@ Full route list: see `api/api.go`.
 | `FOREMAN_DEFAULT_LEASE_SEC`      | `60`        | Lease length when claim omits one. |
 | `FOREMAN_SCHEDULER_INTERVAL_SEC` | `1`         | Scheduler tick cadence. |
 | `FOREMAN_RETENTION_DAYS`         | `0`         | Delete terminal jobs older than this (0 = keep forever). |
+| `FOREMAN_TABLE_PREFIX`           | `foreman_`  | Prepended to every table + constraint + index name so Foreman can share a Postgres database with another app. Set to `""` explicitly to opt out. |
 
 ## Layout
 

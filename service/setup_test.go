@@ -86,7 +86,9 @@ func TestMain(m *testing.M) {
 // (we use ULIDs) but doesn't hurt.
 func resetDB(t *testing.T) {
 	t.Helper()
-	if err := database.DB.Exec("TRUNCATE jobs, job_runs, schedules RESTART IDENTITY CASCADE").Error; err != nil {
+	sql := fmt.Sprintf("TRUNCATE %s, %s, %s RESTART IDENTITY CASCADE",
+		model.TableJobs(), model.TableJobRuns(), model.TableSchedules())
+	if err := database.DB.Exec(sql).Error; err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 }

@@ -58,6 +58,14 @@ var DatabaseUser = os.Getenv("DATABASE_USER")
 var DatabasePassword = os.Getenv("DATABASE_PASSWORD")
 var DatabaseName = os.Getenv("DATABASE_NAME")
 
+// TablePrefix is prepended to every table name (jobs, job_runs,
+// schedules). Lets Foreman safely share a Postgres database with
+// another application without colliding on common names like `jobs`.
+// Defaults to "foreman_". Set FOREMAN_TABLE_PREFIX="" explicitly to
+// opt out of any prefix. Resolved in Verify() so distinguishing
+// "unset" from "explicitly empty" goes through LookupEnv.
+var TablePrefix string
+
 func IsProduction() bool {
 	return Env == "PROD"
 }

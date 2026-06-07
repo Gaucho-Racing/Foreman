@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strconv"
 
 	"github.com/gaucho-racing/foreman/pkg/logger"
@@ -42,6 +43,16 @@ func Verify() {
 	// 0 disables — accept that explicitly so the default behavior is
 	// "keep forever," matching what existed before this knob.
 	RetentionDays = intEnv(RetentionDaysRaw, "FOREMAN_RETENTION_DAYS", 0)
+
+	// LookupEnv distinguishes "unset" (apply default) from "set to ''"
+	// (caller explicitly wants no prefix). Either is valid; we just
+	// can't conflate them with the usual ==""-means-default trick.
+	if raw, ok := os.LookupEnv("FOREMAN_TABLE_PREFIX"); ok {
+		TablePrefix = raw
+	} else {
+		TablePrefix = "foreman_"
+		logger.SugarLogger.Infof("FOREMAN_TABLE_PREFIX is not set, defaulting to %q", TablePrefix)
+	}
 }
 
 func intEnv(raw, name string, def int) int {

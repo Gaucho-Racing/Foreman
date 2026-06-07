@@ -69,7 +69,7 @@ type Job struct {
 	UpdatedAt   time.Time  `json:"updated_at" gorm:"autoUpdateTime;precision:6"`
 }
 
-func (Job) TableName() string { return "jobs" }
+func (Job) TableName() string { return TableJobs() }
 
 func (j Job) IsTerminal() bool {
 	return j.Status == StatusSucceeded || j.Status == StatusFailed || j.Status == StatusCancelled
