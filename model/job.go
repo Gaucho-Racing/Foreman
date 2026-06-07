@@ -33,14 +33,23 @@ const (
 //     can show success output without joining.
 type Job struct {
 	ID      string `json:"id" gorm:"primaryKey"`
-	Kind    string `json:"kind" gorm:"uniqueIndex:idx_jobs_kind_idem;not null"`
+	Kind    string `json:"kind" gorm:"not null"`
 	Queue   string `json:"queue" gorm:"index;not null;default:default"`
 	Service string `json:"service" gorm:"index"`
 
 	// IdempotencyKey is unique within a kind. Nullable: ad-hoc jobs may
 	// skip dedup. Postgres' default NULLS DISTINCT lets multiple
 	// non-deduped enqueues coexist.
-	IdempotencyKey *string `json:"idempotency_key,omitempty" gorm:"uniqueIndex:idx_jobs_kind_idem"`
+	//
+	// The supporting `idx_<prefix>jobs_kind_idem` UNIQUE index is
+	// created in applySchemaExtensions (idempotent CREATE INDEX IF NOT
+	// EXISTS) rather than via a GORM uniqueIndex tag. AutoMigrate
+	// only honors uniqueIndex tags on fresh table creation — operators
+	// migrating from the legacy unprefixed `jobs` table (or otherwise
+	// importing pre-existing data into foreman_jobs) ended up without
+	// the index, and Enqueue's ON CONFLICT (kind, idempotency_key)
+	// inference failed at runtime with "no matching constraint."
+	IdempotencyKey *string `json:"idempotency_key,omitempty"`
 
 	// Params is the input payload — frozen at enqueue time.
 	Params      JSON `json:"params,omitempty" gorm:"type:jsonb"`

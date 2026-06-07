@@ -103,6 +103,17 @@ func applySchemaExtensions(db *gorm.DB) error {
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_due
 			ON %[1]s (next_fire_at)
 			WHERE enabled;`, scheds),
+
+		// Idempotency-key uniqueness drives Enqueue's ON CONFLICT
+		// inference. Lives here (not on a GORM uniqueIndex tag) because
+		// AutoMigrate only creates uniqueIndex constraints on fresh
+		// table creation — operators migrating data from the legacy
+		// unprefixed `jobs` table (or any pre-existing import) end up
+		// without it. CREATE INDEX IF NOT EXISTS is safe to run every
+		// boot. NULLS DISTINCT is Postgres' default, so multiple jobs
+		// with NULL idempotency_key (ad-hoc, non-deduped) coexist.
+		fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS idx_%[1]s_kind_idem
+			ON %[1]s (kind, idempotency_key);`, jobs),
 	}
 	for _, s := range stmts {
 		if err := db.Exec(s).Error; err != nil {
