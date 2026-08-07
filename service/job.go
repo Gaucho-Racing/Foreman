@@ -512,6 +512,26 @@ func CurrentRun(jobID string) (*model.JobRun, error) {
 	return &run, nil
 }
 
+// LastRun returns the most recent attempt at a job whatever its status,
+// so callers can read a finished attempt's progress / error / result.
+// CurrentRun only ever matches a running attempt, which leaves pending
+// (bounced, awaiting re-claim) and terminal jobs with nothing to show.
+// Returns nil when the job has never been claimed.
+func LastRun(jobID string) (*model.JobRun, error) {
+	var run model.JobRun
+	err := database.DB.
+		Where("job_id = ?", jobID).
+		Order("attempt DESC").
+		First(&run).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &run, nil
+}
+
 // ListRuns returns every attempt at the given job, oldest first.
 func ListRuns(jobID string) ([]model.JobRun, error) {
 	var runs []model.JobRun
@@ -665,6 +685,30 @@ func CurrentRunsForJobs(jobIDs []string) (map[string]model.JobRun, error) {
 		Where("job_id IN ? AND status = ?", jobIDs, model.RunStatusRunning).
 		Find(&runs).Error
 	if err != nil {
+		return nil, err
+	}
+	for _, r := range runs {
+		out[r.JobID] = r
+	}
+	return out, nil
+}
+
+// LastRunsForJobs batches LastRun across many jobs in one query, for the
+// jobs-list ?include=last_run expansion. DISTINCT ON keeps a single row
+// per job_id — the highest attempt — so a 50-row list costs one query
+// rather than one per job. Returns a map keyed by job_id; jobs that have
+// never been claimed simply have no entry.
+func LastRunsForJobs(jobIDs []string) (map[string]model.JobRun, error) {
+	out := make(map[string]model.JobRun, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return out, nil
+	}
+	var runs []model.JobRun
+	sql := fmt.Sprintf(
+		`SELECT DISTINCT ON (job_id) * FROM %s WHERE job_id IN ? ORDER BY job_id, attempt DESC`,
+		model.TableJobRuns(),
+	)
+	if err := database.DB.Raw(sql, jobIDs).Scan(&runs).Error; err != nil {
 		return nil, err
 	}
 	for _, r := range runs {

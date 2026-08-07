@@ -78,6 +78,11 @@ type Job struct {
 	// CurrentRun is populated only when a Get/List was called with
 	// include=current_run. nil otherwise.
 	CurrentRun *Run `json:"current_run,omitempty"`
+	// LastRun is populated only when a Get/List was called with
+	// include=last_run. Unlike CurrentRun it survives the attempt
+	// finishing, so it still carries progress / error / result on a
+	// pending-after-retry or terminal job. nil otherwise.
+	LastRun *Run `json:"last_run,omitempty"`
 }
 
 // Run is one attempt at a Job. Each Claim creates a new Run.
@@ -190,6 +195,7 @@ type JobsFilter struct {
 	Limit             int
 	Cursor            string
 	IncludeCurrentRun bool
+	IncludeLastRun    bool
 }
 
 type RunsFilter struct {
@@ -429,8 +435,17 @@ func (c *Client) ListJobs(ctx context.Context, f JobsFilter) ([]Job, error) {
 	if f.Cursor != "" {
 		q.Set("cursor", f.Cursor)
 	}
+	// The server parses ?include= as a comma-separated set, so asking for
+	// both in one call is a single request.
+	var include []string
 	if f.IncludeCurrentRun {
-		q.Set("include", "current_run")
+		include = append(include, "current_run")
+	}
+	if f.IncludeLastRun {
+		include = append(include, "last_run")
+	}
+	if len(include) > 0 {
+		q.Set("include", strings.Join(include, ","))
 	}
 	var out []Job
 	if err := c.simpleJSON(ctx, http.MethodGet, "/foreman/jobs", queryParams{q: q}, &out, "list-jobs"); err != nil {

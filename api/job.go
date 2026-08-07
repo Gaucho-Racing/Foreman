@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gaucho-racing/foreman/model"
@@ -187,11 +188,33 @@ func FailRun(c *gin.Context) {
 
 // ---------- Job reads ----------
 
-// jobWithRun is the response shape when ?include=current_run is set on
-// /jobs or /jobs/:id. CurrentRun is null when no in-flight run exists.
+// jobWithRun is the response shape when ?include= is set on /jobs or
+// /jobs/:id. CurrentRun is null when no in-flight run exists. LastRun is
+// omitted entirely unless asked for, so include=current_run responses stay
+// byte-identical to what they were before last_run existed.
 type jobWithRun struct {
 	model.Job
 	CurrentRun *model.JobRun `json:"current_run"`
+	LastRun    *model.JobRun `json:"last_run,omitempty"`
+}
+
+// includeSet parses the comma-separated ?include= param. Two values are
+// recognized:
+//
+//   - current_run — the in-flight attempt; null unless the job is active.
+//   - last_run    — the newest attempt whatever its status, so pending and
+//     terminal jobs still carry progress / error / result.
+//
+// Unknown values are ignored rather than rejected, so adding one later
+// can't break a client that already sends it.
+func includeSet(c *gin.Context) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(c.Query("include"), ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out[p] = true
+		}
+	}
+	return out
 }
 
 func GetJob(c *gin.Context) {
@@ -199,16 +222,29 @@ func GetJob(c *gin.Context) {
 	if respondServiceErr(c, err) {
 		return
 	}
-	if c.Query("include") != "current_run" {
+	inc := includeSet(c)
+	if !inc["current_run"] && !inc["last_run"] {
 		c.JSON(http.StatusOK, job)
 		return
 	}
-	run, err := service.CurrentRun(job.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	out := jobWithRun{Job: job}
+	if inc["current_run"] {
+		run, err := service.CurrentRun(job.ID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out.CurrentRun = run
 	}
-	c.JSON(http.StatusOK, jobWithRun{Job: job, CurrentRun: run})
+	if inc["last_run"] {
+		run, err := service.LastRun(job.ID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out.LastRun = run
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func ListJobs(c *gin.Context) {
@@ -225,7 +261,8 @@ func ListJobs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if c.Query("include") != "current_run" {
+	inc := includeSet(c)
+	if !inc["current_run"] && !inc["last_run"] {
 		c.JSON(http.StatusOK, jobs)
 		return
 	}
@@ -233,21 +270,41 @@ func ListJobs(c *gin.Context) {
 	for i, j := range jobs {
 		ids[i] = j.ID
 	}
-	runs, err := service.CurrentRunsForJobs(ids)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	var current, last map[string]model.JobRun
+	if inc["current_run"] {
+		current, err = service.CurrentRunsForJobs(ids)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if inc["last_run"] {
+		last, err = service.LastRunsForJobs(ids)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	out := make([]jobWithRun, len(jobs))
 	for i, j := range jobs {
-		var run *model.JobRun
-		if r, ok := runs[j.ID]; ok {
-			r := r // local copy so the pointer is stable across loop iterations
-			run = &r
+		out[i] = jobWithRun{
+			Job:        j,
+			CurrentRun: runFor(current, j.ID),
+			LastRun:    runFor(last, j.ID),
 		}
-		out[i] = jobWithRun{Job: j, CurrentRun: run}
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// runFor pulls a job's run out of a batch map as a pointer. The local copy
+// matters: taking &m[id] isn't allowed for maps, and reusing a loop variable's
+// address would leave every row pointing at the last one.
+func runFor(m map[string]model.JobRun, jobID string) *model.JobRun {
+	r, ok := m[jobID]
+	if !ok {
+		return nil
+	}
+	return &r
 }
 
 // ListJobRuns returns every attempt at a job, oldest first. 404s match
