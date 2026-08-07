@@ -57,12 +57,20 @@ func StreamJobEvents(c *gin.Context) {
 	}
 }
 
-// buildJobEvent wraps a Job with its in-flight Run for SSE consumers.
-// Reuses the jobWithRun shape that /jobs?include=current_run already
-// returns so the dashboard's decode path is identical for both. Errors
-// looking up the run are swallowed — better to push the bare job than
-// drop the event entirely.
+// buildJobEvent wraps a Job with its Run for SSE consumers. Reuses the
+// jobWithRun shape that /jobs?include= already returns so the dashboard's
+// decode path is identical for both. Errors looking up the run are
+// swallowed — better to push the bare job than drop the event entirely.
+//
+// One query serves both fields: the newest attempt IS the in-flight one
+// whenever a job is running, so current_run keeps its exact old meaning
+// (non-null only while an attempt holds the lease) while last_run also
+// carries the final reading once the job stops.
 func buildJobEvent(job model.Job) jobWithRun {
-	run, _ := service.CurrentRun(job.ID)
-	return jobWithRun{Job: job, CurrentRun: run}
+	last, _ := service.LastRun(job.ID)
+	ev := jobWithRun{Job: job, LastRun: last}
+	if last != nil && last.Status == model.RunStatusRunning {
+		ev.CurrentRun = last
+	}
+	return ev
 }

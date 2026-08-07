@@ -361,6 +361,129 @@ func TestFail_OnCancelRequestedTerminalizesAsCancelled(t *testing.T) {
 	}
 }
 
+// ---------- LastRun / LastRunsForJobs ----------
+
+func TestLastRun_NilWhenNeverClaimed(t *testing.T) {
+	resetDB(t)
+	job := mustEnqueue(t, "k")
+	run, err := LastRun(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run != nil {
+		t.Fatalf("expected nil for an unclaimed job, got attempt %d", run.Attempt)
+	}
+}
+
+// The whole point of LastRun: CurrentRun goes nil the moment an attempt
+// finishes, so a bounced job has nothing to show without this.
+func TestLastRun_SurvivesFailedAttemptWhereCurrentRunDoesNot(t *testing.T) {
+	resetDB(t)
+	_ = mustEnqueue(t, "k", withMaxAttempts(3))
+	res, _, _ := Claim(ClaimParams{Kinds: []string{"k"}, WorkerID: "w-1", LeaseSec: 30})
+	if _, err := Fail(res.Run.ID, "w-1", "boom", true, 0, []byte(`{"rows":7}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := CurrentRun(res.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current != nil {
+		t.Fatalf("CurrentRun should be nil after the attempt failed, got %s", current.Status)
+	}
+
+	last, err := LastRun(res.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last == nil {
+		t.Fatal("LastRun must return the failed attempt")
+	}
+	if last.Status != model.RunStatusFailed || last.Error != "boom" {
+		t.Fatalf("expected the failed attempt, got status=%s error=%q", last.Status, last.Error)
+	}
+	jsonEqual(t, last.Result, []byte(`{"rows":7}`))
+}
+
+func TestLastRun_ReturnsHighestAttempt(t *testing.T) {
+	resetDB(t)
+	_ = mustEnqueue(t, "k", withMaxAttempts(3))
+	first, _, _ := Claim(ClaimParams{Kinds: []string{"k"}, WorkerID: "w-1", LeaseSec: 30})
+	if _, err := Fail(first.Run.ID, "w-1", "first", true, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	second, found, err := Claim(ClaimParams{Kinds: []string{"k"}, WorkerID: "w-2", LeaseSec: 30})
+	if err != nil || !found {
+		t.Fatalf("re-claim: found=%v err=%v", found, err)
+	}
+
+	last, err := LastRun(second.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last == nil || last.Attempt != 2 {
+		t.Fatalf("expected attempt 2, got %+v", last)
+	}
+	// Attempt 2 is in flight, so here last_run and current_run agree.
+	if last.Status != model.RunStatusRunning {
+		t.Fatalf("expected the running attempt, got %s", last.Status)
+	}
+}
+
+func TestLastRunsForJobs_OneRowPerJobAtHighestAttempt(t *testing.T) {
+	resetDB(t)
+	// Job A: two attempts, newest failed. Job B: one running attempt.
+	// Job C: never claimed, so it must be absent from the map.
+	_ = mustEnqueue(t, "a", withMaxAttempts(3))
+	a1, _, _ := Claim(ClaimParams{Kinds: []string{"a"}, WorkerID: "w-1", LeaseSec: 30})
+	if _, err := Fail(a1.Run.ID, "w-1", "a-first", true, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	a2, _, _ := Claim(ClaimParams{Kinds: []string{"a"}, WorkerID: "w-1", LeaseSec: 30})
+	if _, err := Fail(a2.Run.ID, "w-1", "a-second", true, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	b := mustClaimNew(t, "b", "w-2")
+	c := mustEnqueue(t, "c")
+
+	got, err := LastRunsForJobs([]string{a2.Job.ID, b.Job.ID, c.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries (c was never claimed), got %d: %+v", len(got), got)
+	}
+	ra, ok := got[a2.Job.ID]
+	if !ok {
+		t.Fatal("job a missing")
+	}
+	if ra.Attempt != 2 || ra.Error != "a-second" {
+		t.Fatalf("job a: expected attempt 2 / a-second, got attempt %d / %q", ra.Attempt, ra.Error)
+	}
+	rb, ok := got[b.Job.ID]
+	if !ok {
+		t.Fatal("job b missing")
+	}
+	if rb.Status != model.RunStatusRunning {
+		t.Fatalf("job b: expected running, got %s", rb.Status)
+	}
+	if _, ok := got[c.ID]; ok {
+		t.Fatal("job c has no runs and must not appear in the map")
+	}
+}
+
+func TestLastRunsForJobs_EmptyInputNoQuery(t *testing.T) {
+	resetDB(t)
+	got, err := LastRunsForJobs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map, got %+v", got)
+	}
+}
+
 // ---------- helpers ----------
 
 func mustClaimNew(t *testing.T, kind, worker string) ClaimResult {
